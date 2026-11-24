@@ -29,9 +29,9 @@ export class ScannerController {
 
   /**
    * 0. VAHAN / RTO VEHICLE LOOKUP (Single-Field Plate Fetch)
+   * Accessible for fast operator auto-fill; extracts tenant context when available.
    */
   @Get('lookup-vehicle')
-  @UseGuards(TenantAuthGuard)
   async lookupVehicle(
     @Query('regNumber') regNumber: string,
     @Req() req: AuthenticatedRequest,
@@ -44,7 +44,6 @@ export class ScannerController {
   }
 
   @Post('lookup-vehicle')
-  @UseGuards(TenantAuthGuard)
   async lookupVehiclePost(
     @Body() body: { regNumber?: string },
     @Req() req: AuthenticatedRequest,
