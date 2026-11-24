@@ -1,0 +1,415 @@
+// PucFlow — Normalized Multi-Tenant Prisma Schema for Supabase PostgreSQL
+// All 15 core domain tables with tenant isolation, foreign keys, composite indexes,
+// unique idempotency constraints, historical PUC certificate cycles, and soft deletes.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model Tenant {
+  id                     String                   @id @default(uuid())
+  businessName           String                   @map("business_name")
+  ownerName              String                   @map("owner_name")
+  mobileNumber           String                   @map("mobile_number")
+  email                  String
+  address                String?
+  logoUrl                String?                  @map("logo_url")
+  timezone               String                   @default("Asia/Kolkata")
+  automationEnabled      Boolean                  @default(true) @map("automation_enabled")
+  autoScheduleOnImport   Boolean                  @default(true) @map("auto_schedule_on_import")
+  defaultLanguage        String                   @default("gu") @map("default_language") // gu | hi | en
+  defaultCallTime        String                   @default("10:00") @map("default_call_time")
+  callingWindowStart     String                   @default("09:30") @map("calling_window_start")
+  callingWindowEnd       String                   @default("19:30") @map("calling_window_end")
+  callingDaysJson        String                   @default("[1,2,3,4,5,6]") @map("calling_days_json")
+  maxAttempts            Int                      @default(3) @map("max_attempts")
+  retryIntervalMinutes   Int                      @default(60) @map("retry_interval_minutes")
+  maxCallsPerCustomer    Int                      @default(6) @map("max_calls_per_customer")
+  expiryWarningDays      Int                      @default(7) @map("expiry_warning_days")
+  createdAt              DateTime                 @default(now()) @map("created_at")
+  updatedAt              DateTime                 @updatedAt @map("updated_at")
+  deletedAt              DateTime?                @map("deleted_at")
+
+  users                  User[]
+  customers              Customer[]
+  vehicles               Vehicle[]
+  pucCertificates        PucCertificate[]
+  reminderRules          ReminderRule[]
+  reminderEvents         ReminderEvent[]
+  callingCampaigns       CallingCampaign[]
+  campaignCustomers      CampaignCustomer[]
+  callJobs               CallJob[]
+  callLogs               CallLog[]
+  voiceTemplates         VoiceTemplate[]
+  telephonyConfig        TelephonyConfiguration?
+  notificationPreference NotificationPreference?
+  auditLogs              AuditLog[]
+
+  @@map("tenants")
+}
+
+model User {
+  id                       String        @id @default(uuid())
+  tenantId                 String        @map("tenant_id")
+  email                    String        @unique
+  fullName                 String        @map("full_name")
+  mobileNumber             String?       @map("mobile_number")
+  passwordHash             String        @map("password_hash")
+  role                     String        @default("owner")
+  emailVerified            Boolean       @default(false) @map("email_verified")
+  verificationToken        String?       @map("verification_token")
+  resetToken               String?       @map("reset_token")
+  resetTokenExpiresAt      DateTime?     @map("reset_token_expires_at")
+  themePreference          String        @default("dark") @map("theme_preference") // dark | light | system
+  lastLoginAt              DateTime?     @map("last_login_at")
+  createdAt                DateTime      @default(now()) @map("created_at")
+  updatedAt                DateTime      @updatedAt @map("updated_at")
+  deletedAt                DateTime?     @map("deleted_at")
+
+  tenant                   Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  sessions                 UserSession[]
+  auditLogs                AuditLog[]
+
+  @@index([tenantId])
+  @@map("users")
+}
+
+model UserSession {
+  id         String    @id @default(uuid())
+  tenantId   String    @map("tenant_id")
+  userId     String    @map("user_id")
+  tokenHash  String    @unique @map("token_hash")
+  userAgent  String?   @map("user_agent")
+  ipAddress  String?   @map("ip_address")
+  expiresAt  DateTime  @map("expires_at")
+  revokedAt  DateTime? @map("revoked_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, userId])
+  @@map("user_sessions")
+}
+
+model Customer {
+  id                String             @id @default(uuid())
+  tenantId          String             @map("tenant_id")
+  fullName          String             @map("full_name")
+  mobileNumber      String             @map("mobile_number")
+  alternateMobile   String?            @map("alternate_mobile")
+  address           String?
+  notes             String?
+  language          String             @default("gu") // gu | hi | en
+  status            String             @default("active") // active | inactive | opted_out
+  consentGiven      Boolean            @default(true) @map("consent_given")
+  dndRegistered     Boolean            @default(false) @map("dnd_registered")
+  remindersEnabled  Boolean            @default(true) @map("reminders_enabled")
+  createdAt         DateTime           @default(now()) @map("created_at")
+  updatedAt         DateTime           @updatedAt @map("updated_at")
+  deletedAt         DateTime?          @map("deleted_at")
+
+  tenant            Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  vehicles          Vehicle[]
+  certificates      PucCertificate[]
+  reminderEvents    ReminderEvent[]
+  campaignCustomers CampaignCustomer[]
+  callJobs          CallJob[]
+  callLogs          CallLog[]
+
+  @@index([tenantId, status])
+  @@index([tenantId, mobileNumber])
+  @@map("customers")
+}
+
+model Vehicle {
+  id                 String           @id @default(uuid())
+  tenantId           String           @map("tenant_id")
+  customerId         String           @map("customer_id")
+  registrationNumber String           @map("registration_number")
+  vehicleType        String           @map("vehicle_type") // 2W | 3W | 4W | LCV | HCV
+  fuelType           String           @map("fuel_type") // Petrol | Diesel | CNG | LPG | Hybrid
+  createdAt          DateTime         @default(now()) @map("created_at")
+  updatedAt          DateTime         @updatedAt @map("updated_at")
+  deletedAt          DateTime?        @map("deleted_at")
+
+  tenant             Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customer           Customer         @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  certificates       PucCertificate[]
+  callLogs           CallLog[]
+
+  @@index([tenantId, customerId])
+  @@index([tenantId, registrationNumber])
+  @@map("vehicles")
+}
+
+model PucCertificate {
+  id                String             @id @default(uuid())
+  tenantId          String             @map("tenant_id")
+  customerId        String             @map("customer_id")
+  vehicleId         String             @map("vehicle_id")
+  certificateNumber String?            @map("certificate_number")
+  issueDate         String             @map("issue_date") // YYYY-MM-DD (Asia/Kolkata)
+  expiryDate        String             @map("expiry_date") // YYYY-MM-DD (Asia/Kolkata)
+  cycleStatus       String             @default("active") @map("cycle_status") // active | renewed | superseded
+  isCurrent         Boolean            @default(true) @map("is_current")
+  renewedAt         DateTime?          @map("renewed_at")
+  createdAt         DateTime           @default(now()) @map("created_at")
+  updatedAt         DateTime           @updatedAt @map("updated_at")
+  deletedAt         DateTime?          @map("deleted_at")
+
+  tenant            Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customer          Customer           @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  vehicle           Vehicle            @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  reminderEvents    ReminderEvent[]
+  campaignCustomers CampaignCustomer[]
+  callJobs          CallJob[]
+  callLogs          CallLog[]
+
+  @@index([tenantId, expiryDate, isCurrent])
+  @@index([tenantId, customerId])
+  @@index([tenantId, vehicleId])
+  @@map("puc_certificates")
+}
+
+model ReminderRule {
+  id              String          @id @default(uuid())
+  tenantId        String          @map("tenant_id")
+  label           String
+  offsetDays      Int             @map("offset_days") // negative = before expiry, 0 = on expiry, positive = after expiry
+  isActive        Boolean         @default(true) @map("is_active")
+  sortOrder       Int             @default(0) @map("sort_order")
+  voiceTemplateId String?         @map("voice_template_id")
+  createdAt       DateTime        @default(now()) @map("created_at")
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+
+  tenant          Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  voiceTemplate   VoiceTemplate?  @relation(fields: [voiceTemplateId], references: [id], onDelete: SetNull)
+  reminderEvents  ReminderEvent[]
+
+  @@unique([tenantId, offsetDays])
+  @@index([tenantId, isActive])
+  @@map("reminder_rules")
+}
+
+model ReminderEvent {
+  id             String         @id @default(uuid())
+  tenantId       String         @map("tenant_id")
+  customerId     String         @map("customer_id")
+  certificateId  String         @map("certificate_id")
+  reminderRuleId String         @map("reminder_rule_id")
+  offsetDays     Int            @map("offset_days")
+  scheduledFor   DateTime       @map("scheduled_for")
+  status         String         @default("scheduled") // scheduled | queued | dispatched | completed | cancelled | skipped
+  skipReason     String?        @map("skip_reason")
+  createdAt      DateTime       @default(now()) @map("created_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at")
+
+  tenant         Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customer       Customer       @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  certificate    PucCertificate @relation(fields: [certificateId], references: [id], onDelete: Cascade)
+  reminderRule   ReminderRule   @relation(fields: [reminderRuleId], references: [id], onDelete: Cascade)
+  callJobs       CallJob[]
+
+  @@unique([tenantId, certificateId, reminderRuleId])
+  @@index([tenantId, status, scheduledFor])
+  @@map("reminder_events")
+}
+
+model VoiceTemplate {
+  id               String            @id @default(uuid())
+  tenantId         String            @map("tenant_id")
+  name             String
+  language         String            // gu | hi | en
+  scriptBody       String            @map("script_body")
+  audioUrl         String?           @map("audio_url")
+  audioFilename    String?           @map("audio_filename")
+  dltTemplateId    String?           @map("dlt_template_id")
+  approvalStatus   String            @default("approved") @map("approval_status") // draft | pending_approval | approved
+  isDefault        Boolean           @default(false) @map("is_default")
+  createdAt        DateTime          @default(now()) @map("created_at")
+  updatedAt        DateTime          @updatedAt @map("updated_at")
+  deletedAt        DateTime?         @map("deleted_at")
+
+  tenant           Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reminderRules    ReminderRule[]
+  callingCampaigns CallingCampaign[]
+
+  @@index([tenantId, language])
+  @@map("voice_templates")
+}
+
+model CallingCampaign {
+  id                String             @id @default(uuid())
+  tenantId          String             @map("tenant_id")
+  name              String
+  description       String?
+  voiceTemplateId   String?            @map("voice_template_id")
+  expiryRangeStart  String?            @map("expiry_range_start")
+  expiryRangeEnd    String?            @map("expiry_range_end")
+  scheduledAt       DateTime?          @map("scheduled_at")
+  status            String             @default("draft") // draft | scheduled | running | paused | completed | stopped
+  totalTargets      Int                @default(0) @map("total_targets")
+  completedCount    Int                @default(0) @map("completed_count")
+  failedCount       Int                @default(0) @map("failed_count")
+  createdAt         DateTime           @default(now()) @map("created_at")
+  updatedAt         DateTime           @updatedAt @map("updated_at")
+  deletedAt         DateTime?          @map("deleted_at")
+
+  tenant            Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  voiceTemplate     VoiceTemplate?     @relation(fields: [voiceTemplateId], references: [id], onDelete: SetNull)
+  campaignCustomers CampaignCustomer[]
+  callLogs          CallLog[]
+
+  @@index([tenantId, status])
+  @@map("calling_campaigns")
+}
+
+model CampaignCustomer {
+  id            String          @id @default(uuid())
+  tenantId      String          @map("tenant_id")
+  campaignId    String          @map("campaign_id")
+  customerId    String          @map("customer_id")
+  certificateId String?         @map("certificate_id")
+  status        String          @default("pending") // pending | queued | completed | failed | skipped | cancelled
+  skipReason    String?         @map("skip_reason")
+  createdAt     DateTime        @default(now()) @map("created_at")
+  updatedAt     DateTime        @updatedAt @map("updated_at")
+
+  tenant        Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  campaign      CallingCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  customer      Customer        @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  certificate   PucCertificate? @relation(fields: [certificateId], references: [id], onDelete: SetNull)
+  callJobs      CallJob[]
+
+  @@unique([tenantId, campaignId, customerId])
+  @@index([tenantId, campaignId, status])
+  @@map("campaign_customers")
+}
+
+model CallJob {
+  id                 String            @id @default(uuid())
+  tenantId           String            @map("tenant_id")
+  reminderEventId    String?           @map("reminder_event_id")
+  campaignCustomerId String?           @map("campaign_customer_id")
+  customerId         String            @map("customer_id")
+  certificateId      String?           @map("certificate_id")
+  idempotencyKey     String            @unique @map("idempotency_key")
+  attemptNumber      Int               @default(1) @map("attempt_number")
+  maxAttempts        Int               @default(3) @map("max_attempts")
+  nextRunAt          DateTime          @map("next_run_at")
+  status             String            @default("scheduled") // queued | scheduled | processing | completed | retrying | failed | cancelled
+  lastError          String?           @map("last_error")
+  createdAt          DateTime          @default(now()) @map("created_at")
+  updatedAt          DateTime          @updatedAt @map("updated_at")
+
+  tenant             Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reminderEvent      ReminderEvent?    @relation(fields: [reminderEventId], references: [id], onDelete: SetNull)
+  campaignCustomer   CampaignCustomer? @relation(fields: [campaignCustomerId], references: [id], onDelete: SetNull)
+  customer           Customer          @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  certificate        PucCertificate?   @relation(fields: [certificateId], references: [id], onDelete: SetNull)
+  callLogs           CallLog[]
+
+  @@index([tenantId, status, nextRunAt])
+  @@map("call_jobs")
+}
+
+model CallLog {
+  id              String           @id @default(uuid())
+  tenantId        String           @map("tenant_id")
+  callJobId       String?          @map("call_job_id")
+  customerId      String           @map("customer_id")
+  vehicleId       String?          @map("vehicle_id")
+  certificateId   String?          @map("certificate_id")
+  campaignId      String?          @map("campaign_id")
+  reminderType    String           @map("reminder_type") // auto_before | auto_on_expiry | auto_after | campaign | manual
+  reminderLabel   String?          @map("reminder_label")
+  phoneNumber     String           @map("phone_number")
+  providerName    String           @default("mock") @map("provider_name")
+  providerCallId  String?          @map("provider_call_id")
+  status          String           @default("queued") // queued | scheduled | initiated | ringing | answered | completed | no_answer | busy | failed | cancelled
+  durationSeconds Int              @default(0) @map("duration_seconds")
+  recordingUrl    String?          @map("recording_url")
+  renderedMessage String?          @map("rendered_message")
+  language        String           @default("gu")
+  errorMessage    String?          @map("error_message")
+  initiatedAt     DateTime?        @map("initiated_at")
+  completedAt     DateTime?        @map("completed_at")
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
+
+  tenant          Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  callJob         CallJob?         @relation(fields: [callJobId], references: [id], onDelete: SetNull)
+  customer        Customer         @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  vehicle         Vehicle?         @relation(fields: [vehicleId], references: [id], onDelete: SetNull)
+  certificate     PucCertificate?  @relation(fields: [certificateId], references: [id], onDelete: SetNull)
+  campaign        CallingCampaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, status])
+  @@index([tenantId, customerId])
+  @@index([providerCallId])
+  @@map("call_logs")
+}
+
+model TelephonyConfiguration {
+  id                     String    @id @default(uuid())
+  tenantId               String    @unique @map("tenant_id")
+  provider               String    @default("exotel") // exotel | mock
+  mode                   String    @default("mock") // mock | live
+  accountSid             String?   @map("account_sid")
+  subdomain              String    @default("api.in.exotel.com")
+  apiKeyEncrypted        String?   @map("api_key_encrypted")
+  apiTokenEncrypted      String?   @map("api_token_encrypted")
+  callerId               String?   @map("caller_id")
+  appUrl                 String?   @map("app_url")
+  webhookSecretEncrypted String?   @map("webhook_secret_encrypted")
+  traiEntityId           String?   @map("trai_entity_id")
+  lastTestedAt           DateTime? @map("last_tested_at")
+  lastTestStatus         String?   @map("last_test_status")
+  createdAt              DateTime  @default(now()) @map("created_at")
+  updatedAt              DateTime  @updatedAt @map("updated_at")
+
+  tenant                 Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("telephony_configurations")
+}
+
+model NotificationPreference {
+  id               String   @id @default(uuid())
+  tenantId         String   @unique @map("tenant_id")
+  callSuccessAlert Boolean  @default(false) @map("call_success_alert")
+  callFailedAlert  Boolean  @default(true) @map("call_failed_alert")
+  dailySummary     Boolean  @default(true) @map("daily_summary")
+  renewalAlerts    Boolean  @default(true) @map("renewal_alerts")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  tenant           Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("notification_preferences")
+}
+
+model AuditLog {
+  id           String   @id @default(uuid())
+  tenantId     String   @map("tenant_id")
+  userId       String?  @map("user_id")
+  action       String
+  entityType   String   @map("entity_type")
+  entityId     String?  @map("entity_id")
+  metadataJson String?  @map("metadata_json")
+  ipAddress    String?  @map("ip_address")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user         User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, entityType, entityId])
+  @@map("audit_logs")
+}
