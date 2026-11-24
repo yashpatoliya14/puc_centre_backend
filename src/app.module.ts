@@ -13,6 +13,8 @@ import { AutomationController } from './modules/automation/automation.controller
 import { SettingsController } from './modules/settings/settings.controller';
 import { ScannerController } from './modules/scanner/scanner.controller';
 import { ScannerService } from './modules/scanner/scanner.service';
+import { WhatsAppController } from './modules/whatsapp/whatsapp.controller';
+import { WhatsAppService } from './modules/whatsapp/whatsapp.service';
 
 @Module({
   controllers: [
@@ -23,6 +25,7 @@ import { ScannerService } from './modules/scanner/scanner.service';
     AutomationController,
     SettingsController,
     ScannerController,
+    WhatsAppController,
   ],
   providers: [
     DatabaseService,
@@ -32,6 +35,7 @@ import { ScannerService } from './modules/scanner/scanner.service';
     SeedService,
     TenantAuthGuard,
     ScannerService,
+    WhatsAppService,
   ],
 })
 export class AppModule {}

@@ -28,6 +28,7 @@ import { addDaysToDateStr, deriveCertificateStatus, getIstDateString } from '../
 import { TenantAuthGuard, type AuthenticatedRequest } from '../auth/auth.guard';
 import { ReminderEngineService } from '../reminders/reminder-engine.service';
 import { AuditService } from '../audit/audit.service';
+import { WhatsAppService } from '../whatsapp/whatsapp.service';
 
 const insuranceInputSchema = z.object({
   hasInsurance: z.boolean().default(false),
@@ -106,6 +107,7 @@ export class CustomersController {
     @Inject(DatabaseService) private readonly db: DatabaseService,
     @Inject(ReminderEngineService) private readonly reminderEngine: ReminderEngineService,
     @Inject(AuditService) private readonly auditService: AuditService,
+    @Inject(WhatsAppService) private readonly whatsappService: WhatsAppService,
   ) {}
 
   private formatCustomerRow(r: CustomerListRow, todayIst: string) {
@@ -705,9 +707,10 @@ export class CustomersController {
       [id, tenantId],
     );
 
+    // Official Meta template text for "puc_certificate_utility"
     const defaultPucTpl =
       tenant?.puc_message_template ||
-      '🚗 *PUC Renewal Reminder*\n\nHello *{customer_name}*,\n\nThe PUC certificate for your vehicle *{vehicle_number}* is expiring on *{expiry_date}*.\n\nKindly visit *{centre_name}* for prompt testing and renewal.\n📞 Helpline: {contact_number}\n\nThank you!';
+      'Hello *{customer_name}*,\n\nYour vehicle\'s PUC certificate for *{vehicle_number}* is expiring on *{expiry_date}*.\n\nPlease renew your PUC certificate before the expiry date to avoid penalties.\n\n🏢 *PUC Centre:* {centre_name}\n👤 *Owner Name:* {owner_name}\n📍 *Address:* {centre_address}\n📞 *Contact Number:* {contact_number}\n\n*Thank you for choosing.*';
 
     const defaultInsTpl =
       tenant?.insurance_message_template ||
@@ -726,6 +729,8 @@ export class CustomersController {
       .replace(/\{policy_number\}/g, insurance?.policy_number || 'N/A')
       .replace(/\{insurance_company\}/g, insurance?.insurance_company || 'Insurance Company')
       .replace(/\{centre_name\}/g, tenant?.business_name || 'PUC Testing Centre')
+      .replace(/\{owner_name\}/g, tenant?.owner_name || 'Centre Owner')
+      .replace(/\{centre_address\}/g, tenant?.address || 'Station Road')
       .replace(/\{contact_number\}/g, tenant?.mobile_number || '');
 
     const digits = customer.mobile_number.replace(/\D/g, '');
@@ -747,6 +752,71 @@ export class CustomersController {
       messageText: rendered,
       whatsappUrl,
       reminderType: type,
+      templateName: type === 'puc' ? 'puc_certificate_utility' : 'vehicle_insurance',
+    };
+  }
+
+  /**
+   * Direct 1-Click Send via Meta WhatsApp Cloud API using "puc_certificate_utility"
+   */
+  @Post(':id/send-whatsapp')
+  async sendDirectWhatsApp(
+    @Param('id') id: string,
+    @Body() body: { reminderType?: 'puc' | 'insurance' },
+    @Req() req: AuthenticatedRequest,
+  ) {
+    const tenantId = req.auth!.tenantId;
+    const type = body?.reminderType || 'puc';
+    const tenant = await this.db.queryOne<TenantRow>(`SELECT * FROM tenants WHERE id = ?`, [tenantId]);
+    const customer = await this.db.queryOne<{ id: string; full_name: string; mobile_number: string }>(
+      `SELECT id, full_name, mobile_number FROM customers WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`,
+      [id, tenantId],
+    );
+    if (!customer) throw new NotFoundException('Customer not found');
+
+    const vehicle = await this.db.queryOne<{ id: string; registration_number: string }>(
+      `SELECT id, registration_number FROM vehicles WHERE customer_id = ? AND tenant_id = ? AND deleted_at IS NULL LIMIT 1`,
+      [id, tenantId],
+    );
+    const cert = await this.db.queryOne<{ expiry_date: string }>(
+      `SELECT expiry_date FROM puc_certificates WHERE customer_id = ? AND tenant_id = ? AND is_current = ? AND deleted_at IS NULL LIMIT 1`,
+      [id, tenantId, true],
+    );
+
+    const regNo = vehicle?.registration_number || 'Vehicle';
+    const expiry = cert?.expiry_date || 'Soon';
+
+    const sendRes = await this.whatsappService.sendPucCertificateReminder({
+      to: customer.mobile_number,
+      customerName: customer.full_name,
+      vehiclePlate: regNo,
+      expiryDate: expiry,
+      centreName: tenant?.business_name || 'PUC Testing Centre',
+      ownerName: tenant?.owner_name || 'Centre Owner',
+      centreAddress: tenant?.address || 'Station Road',
+      contactNumber: tenant?.mobile_number || 'Helpline',
+    });
+
+    await this.auditService.log({
+      tenantId,
+      userId: req.auth!.userId,
+      action: 'whatsapp_reminder.delivered',
+      entityType: 'customer',
+      entityId: id,
+      metadata: {
+        messageId: sendRes.messageId,
+        template: sendRes.template,
+        phone: customer.mobile_number,
+        vehicle: regNo,
+      },
+    });
+
+    return {
+      ok: true,
+      messageId: sendRes.messageId,
+      template: sendRes.template,
+      recipient: customer.mobile_number,
+      customerName: customer.full_name,
     };
   }
 
