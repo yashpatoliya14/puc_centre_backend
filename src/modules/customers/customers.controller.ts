@@ -470,8 +470,8 @@ export class CustomersController {
       [tenantId],
     );
 
-    const callsEnabled = toBool(tenant?.calls_enabled ?? tenant?.automation_enabled ?? true);
-    const autoCallOnReg = toBool(tenant?.auto_call_on_registration ?? true);
+    const callsEnabled = toBool(tenant?.calls_enabled ?? false);
+    const autoCallOnReg = toBool(tenant?.auto_call_on_registration ?? false);
 
     let autoCallPlaced = false;
     let autoCallStatus: string | null = null;
