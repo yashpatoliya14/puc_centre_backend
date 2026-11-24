@@ -63,7 +63,9 @@ export class AuthController {
 
   private async createSession(user: UserRow, req: AuthenticatedRequest): Promise<string> {
     const sessionId = crypto.randomUUID();
-    const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
+    // 30 days (~1 month) session token validity
+    const SESSION_EXPIRATION_MS = 30 * 24 * 60 * 60 * 1000;
+    const expiresAt = Date.now() + SESSION_EXPIRATION_MS;
     const token = signSessionToken({
       sid: sessionId,
       uid: user.id,
