@@ -11,6 +11,7 @@ import {
   BadRequestException,
   Logger,
 } from '@nestjs/common';
+import * as crypto from 'crypto';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { TenantAuthGuard, type AuthenticatedRequest } from '../auth/auth.guard';
 import { ScannerService, ExtractedPucData } from './scanner.service';
@@ -149,37 +150,56 @@ export class ScannerController {
     }
 
     // Auto-create or update customer record in the tenant's database
-    const customerId = `cust_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const customerId = crypto.randomUUID();
+    const vehicleId = crypto.randomUUID();
+    const certId = crypto.randomUUID();
+    const nowIso = new Date().toISOString();
     const today = getIstDateString();
 
     const fullName = extracted.fullName || 'Registered via WhatsApp';
     const mobile = extracted.mobileNumber || senderNumber.slice(-10);
+    const regNo = extracted.regNumber;
 
-    await this.db.execute(
-      `INSERT INTO customers (
-        id, tenant_id, full_name, mobile_number, reg_number,
-        vehicle_type, fuel_type, make_model, issue_date,
-        expiry_date, calls_enabled, auto_call_on_reg, preferred_language, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 'gu', ?, ?)
-      ON CONFLICT(tenant_id, reg_number) DO UPDATE SET
-        expiry_date = excluded.expiry_date,
-        issue_date = excluded.issue_date,
-        updated_at = excluded.updated_at`,
-      [
-        customerId,
-        tenant.id,
-        fullName,
-        mobile,
-        extracted.regNumber,
-        extracted.vehicleType || '4-Wheeler',
-        extracted.fuelType || 'Petrol',
-        extracted.makeModel || null,
-        extracted.issueDate || today,
-        extracted.expiryDate || today,
-        new Date().toISOString(),
-        new Date().toISOString(),
-      ],
+    // Check if vehicle already exists for this tenant
+    const existingVehicle = await this.db.queryOne<{ id: string; customer_id: string }>(
+      `SELECT id, customer_id FROM vehicles WHERE tenant_id = ? AND UPPER(REPLACE(registration_number, ' ', '')) = ? AND deleted_at IS NULL`,
+      [tenant.id, regNo],
     );
+
+    if (existingVehicle) {
+      await this.db.execute(
+        `UPDATE puc_certificates SET is_current = 0 WHERE vehicle_id = ? AND tenant_id = ?`,
+        [existingVehicle.id, tenant.id],
+      );
+      await this.db.execute(
+        `INSERT INTO puc_certificates (id, tenant_id, customer_id, vehicle_id, certificate_number, issue_date, expiry_date, cycle_status, is_current, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)`,
+        [certId, tenant.id, existingVehicle.customer_id, existingVehicle.id, extracted.certificateNumber || null, extracted.issueDate || today, extracted.expiryDate || today, nowIso, nowIso],
+      );
+    } else {
+      let cust = await this.db.queryOne<{ id: string }>(
+        `SELECT id FROM customers WHERE tenant_id = ? AND mobile_number = ? AND deleted_at IS NULL`,
+        [tenant.id, mobile],
+      );
+      const targetCustId = cust ? cust.id : customerId;
+      if (!cust) {
+        await this.db.execute(
+          `INSERT INTO customers (id, tenant_id, full_name, mobile_number, language, status, consent_given, dnd_registered, reminders_enabled, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 'gu', 'active', 1, 0, 1, ?, ?)`,
+          [targetCustId, tenant.id, fullName, mobile, nowIso, nowIso],
+        );
+      }
+      await this.db.execute(
+        `INSERT INTO vehicles (id, tenant_id, customer_id, registration_number, vehicle_type, fuel_type, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [vehicleId, tenant.id, targetCustId, regNo, extracted.vehicleType || '4-Wheeler', extracted.fuelType || 'Petrol', nowIso, nowIso],
+      );
+      await this.db.execute(
+        `INSERT INTO puc_certificates (id, tenant_id, customer_id, vehicle_id, certificate_number, issue_date, expiry_date, cycle_status, is_current, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)`,
+        [certId, tenant.id, targetCustId, vehicleId, extracted.certificateNumber || null, extracted.issueDate || today, extracted.expiryDate || today, nowIso, nowIso],
+      );
+    }
 
     return {
       ok: true,

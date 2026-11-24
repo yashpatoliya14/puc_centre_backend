@@ -334,15 +334,23 @@ export class ScannerService {
       reg_number: string;
       vehicle_type: string;
       fuel_type: string;
-      make_model: string | null;
-      issue_date: string;
-      expiry_date: string;
+      certificate_number: string | null;
+      issue_date: string | null;
+      expiry_date: string | null;
+      insurance_company: string | null;
+      insurance_expiry: string | null;
     }>(
-      `SELECT full_name, mobile_number, reg_number, vehicle_type, fuel_type, make_model, issue_date, expiry_date
-       FROM customers
-       WHERE reg_number = ?
-       ORDER BY updated_at DESC LIMIT 1`,
-      [cleanReg],
+      `SELECT c.full_name, c.mobile_number, v.registration_number AS reg_number,
+              v.vehicle_type, v.fuel_type,
+              pc.certificate_number, pc.issue_date, pc.expiry_date,
+              vi.insurance_company, vi.expiry_date AS insurance_expiry
+       FROM vehicles v
+       INNER JOIN customers c ON c.id = v.customer_id AND c.deleted_at IS NULL
+       LEFT JOIN puc_certificates pc ON pc.vehicle_id = v.id AND pc.is_current = ? AND pc.deleted_at IS NULL
+       LEFT JOIN vehicle_insurances vi ON vi.vehicle_id = v.id AND vi.deleted_at IS NULL
+       WHERE REPLACE(REPLACE(UPPER(v.registration_number), ' ', ''), '-', '') = ? AND v.deleted_at IS NULL
+       ORDER BY v.updated_at DESC LIMIT 1`,
+      [true, cleanReg],
     );
 
     if (existing) {
@@ -352,9 +360,11 @@ export class ScannerService {
         mobileNumber: existing.mobile_number,
         vehicleType: existing.vehicle_type || '4-Wheeler',
         fuelType: existing.fuel_type || 'Petrol',
-        makeModel: existing.make_model || 'Known Vehicle',
-        issueDate: today,
-        expiryDate: expiryDefault,
+        makeModel: 'Existing Registered Vehicle',
+        issueDate: existing.issue_date || today,
+        expiryDate: existing.expiry_date || expiryDefault,
+        insuranceCompany: existing.insurance_company || undefined,
+        insuranceExpiry: existing.insurance_expiry || undefined,
         source: 'PUCFlow Registry (Previous Record)',
       };
     }
