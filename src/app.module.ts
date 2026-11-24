@@ -11,6 +11,8 @@ import { CustomersController } from './modules/customers/customers.controller';
 import { DashboardController } from './modules/dashboard/dashboard.controller';
 import { AutomationController } from './modules/automation/automation.controller';
 import { SettingsController } from './modules/settings/settings.controller';
+import { ScannerController } from './modules/scanner/scanner.controller';
+import { ScannerService } from './modules/scanner/scanner.service';
 
 @Module({
   controllers: [
@@ -20,6 +22,7 @@ import { SettingsController } from './modules/settings/settings.controller';
     DashboardController,
     AutomationController,
     SettingsController,
+    ScannerController,
   ],
   providers: [
     DatabaseService,
@@ -28,6 +31,7 @@ import { SettingsController } from './modules/settings/settings.controller';
     ReminderEngineService,
     SeedService,
     TenantAuthGuard,
+    ScannerService,
   ],
 })
 export class AppModule {}
