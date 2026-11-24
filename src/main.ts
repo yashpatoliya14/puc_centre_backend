@@ -31,6 +31,7 @@ async function bootstrap() {
   const reminderEngine = app.get(ReminderEngineService);
   reminderEngine.startBackgroundLoops();
 
+  // Start NestJS HTTP listener on configured port
   const port = Number(process.env.PORT) || 3000;
   await app.listen(port, '0.0.0.0');
   console.log(`[PucFlow Server] NestJS API running on http://0.0.0.0:${port} (DB: ${dbService.getEngine()})`);
