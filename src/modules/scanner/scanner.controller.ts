@@ -3,6 +3,7 @@ import {
   Post,
   Get,
   Body,
+  Query,
   UploadedFile,
   UseInterceptors,
   UseGuards,
@@ -24,6 +25,35 @@ export class ScannerController {
     private readonly scannerService: ScannerService,
     private readonly db: DatabaseService,
   ) {}
+
+  /**
+   * 0. VAHAN / RTO VEHICLE LOOKUP (Single-Field Plate Fetch)
+   */
+  @Get('lookup-vehicle')
+  @UseGuards(TenantAuthGuard)
+  async lookupVehicle(
+    @Query('regNumber') regNumber: string,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    if (!regNumber || !regNumber.trim()) {
+      throw new BadRequestException('regNumber query parameter is required');
+    }
+    const data = await this.scannerService.lookupVehicle(regNumber.trim(), req.auth?.tenantId);
+    return { ok: true, data };
+  }
+
+  @Post('lookup-vehicle')
+  @UseGuards(TenantAuthGuard)
+  async lookupVehiclePost(
+    @Body() body: { regNumber?: string },
+    @Req() req: AuthenticatedRequest,
+  ) {
+    if (!body?.regNumber || !body.regNumber.trim()) {
+      throw new BadRequestException('regNumber is required');
+    }
+    const data = await this.scannerService.lookupVehicle(body.regNumber.trim(), req.auth?.tenantId);
+    return { ok: true, data };
+  }
 
   /**
    * 1. PARSE OFFICIAL PARIVAHAN PUC PDF
