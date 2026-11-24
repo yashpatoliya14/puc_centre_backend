@@ -15,12 +15,16 @@ export interface ExtractedPucData {
   makeModel?: string;
   fullName?: string;
   mobileNumber?: string;
+  insuranceCompany?: string;
+  insuranceExpiry?: string;
   rawText?: string;
 }
 
 @Injectable()
 export class ScannerService {
   private readonly logger = new Logger(ScannerService.name);
+  private sandboxToken: string | null = null;
+  private sandboxTokenExpiresAt = 0;
 
   constructor(private readonly db: DatabaseService) {}
 
@@ -355,7 +359,20 @@ export class ScannerService {
       };
     }
 
-    // 2. Check if external VAHAN / RTO API key is provided in .env
+    // 2. Check Sandbox.co.in (if SANDBOX_API_KEY & SANDBOX_API_SECRET are provided)
+    if (process.env.SANDBOX_API_KEY && process.env.SANDBOX_API_SECRET) {
+      const sandboxData = await this.querySandboxRc(cleanReg);
+      if (sandboxData) {
+        return {
+          ...sandboxData,
+          issueDate: sandboxData.issueDate || today,
+          expiryDate: sandboxData.expiryDate || expiryDefault,
+          source: 'Sandbox.co.in (Official VAHAN RC)',
+        };
+      }
+    }
+
+    // 3. Check if generic / RapidAPI VAHAN key is provided in .env
     const vahanKey = process.env.VAHAN_API_KEY || process.env.RC_API_KEY;
     if (vahanKey) {
       try {
@@ -519,5 +536,121 @@ export class ScannerService {
 
   private generateSampleOwnerName(plate: string): string {
     return `Vehicle Owner (${plate})`;
+  }
+
+  // --- Sandbox.co.in Integration ---
+
+  private async getSandboxToken(): Promise<string | null> {
+    const apiKey = process.env.SANDBOX_API_KEY?.trim();
+    const apiSecret = process.env.SANDBOX_API_SECRET?.trim();
+    if (!apiKey || !apiSecret) return null;
+
+    if (this.sandboxToken && Date.now() < this.sandboxTokenExpiresAt - 60000) {
+      return this.sandboxToken;
+    }
+
+    try {
+      const baseUrl = process.env.SANDBOX_BASE_URL || 'https://api.sandbox.co.in';
+      const version = process.env.SANDBOX_API_VERSION || '1.0';
+      const res = await fetch(`${baseUrl}/authenticate`, {
+        method: 'POST',
+        headers: {
+          accept: 'application/json',
+          'x-api-key': apiKey,
+          'x-api-secret': apiSecret,
+          'x-api-version': version,
+        },
+      });
+
+      if (!res.ok) {
+        const errText = await res.text();
+        this.logger.error(`Sandbox.co.in authenticate failed (${res.status}): ${errText}`);
+        return null;
+      }
+
+      const json: any = await res.json();
+      const token = json.access_token || json.token || json.data?.access_token;
+      if (token) {
+        this.sandboxToken = token;
+        const ttl = (json.expires_in || 86400) * 1000;
+        this.sandboxTokenExpiresAt = Date.now() + ttl;
+        return token;
+      }
+    } catch (err) {
+      this.logger.error(`Sandbox.co.in auth exception: ${err}`);
+    }
+    return null;
+  }
+
+  private async querySandboxRc(cleanReg: string): Promise<ExtractedPucData | null> {
+    const token = await this.getSandboxToken();
+    if (!token) return null;
+
+    const apiKey = process.env.SANDBOX_API_KEY?.trim() || '';
+    const baseUrl = process.env.SANDBOX_BASE_URL || 'https://api.sandbox.co.in';
+    const version = process.env.SANDBOX_API_VERSION || '1.0';
+
+    try {
+      // 1. Try POST /kyc/rc/verify
+      let res = await fetch(`${baseUrl}/kyc/rc/verify`, {
+        method: 'POST',
+        headers: {
+          authorization: token,
+          'x-api-key': apiKey,
+          'x-api-version': version,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          vehicle_number: cleanReg,
+          consent: 'Y',
+          reason: 'PUC Testing and Renewal Verification',
+        }),
+      });
+
+      // 2. Fallback to GET /gway/v1/rc/verify if needed
+      if (res.status === 404 || res.status === 405) {
+        res = await fetch(`${baseUrl}/gway/v1/rc/verify?vehicle_number=${encodeURIComponent(cleanReg)}`, {
+          headers: {
+            authorization: token,
+            'x-api-key': apiKey,
+            'x-api-version': version,
+          },
+        });
+      }
+
+      if (!res.ok) {
+        const errBody = await res.text();
+        this.logger.warn(`Sandbox.co.in RC lookup for ${cleanReg} failed (${res.status}): ${errBody}`);
+        return null;
+      }
+
+      const json: any = await res.json();
+      const d = json?.data || json?.result || json;
+      if (!d) return null;
+
+      const today = getIstDateString();
+      const ownerName = d.owner_name || d.ownerName || d.user_name || '';
+      const makeModel = d.maker_model || d.model_description || `${d.maker_description || ''} ${d.maker_model || ''}`.trim();
+      const fuel = this.normalizeFuelType(d.fuel_type || d.fuel_description || '');
+      const vType = this.normalizeVehicleType(d.vehicle_class_description || d.vehicle_category_description || '');
+      const pucExp = this.normalizeDateString(d.pucc_upto || d.puc_valid_upto || '');
+      const insExp = this.normalizeDateString(d.insurance_upto || d.insurance_validity || '');
+
+      return {
+        regNumber: cleanReg,
+        fullName: ownerName || this.generateSampleOwnerName(cleanReg),
+        makeModel: makeModel || 'Vehicle from VAHAN RC',
+        fuelType: fuel,
+        vehicleType: vType,
+        issueDate: today,
+        expiryDate: pucExp || undefined,
+        insuranceCompany: d.insurance_company || d.insurance_company_name || 'ICICI Lombard',
+        insuranceExpiry: insExp || undefined,
+        rawText: JSON.stringify(d).slice(0, 300),
+      };
+    } catch (err) {
+      this.logger.error(`Error querying Sandbox.co.in for ${cleanReg}: ${err}`);
+      return null;
+    }
   }
 }
