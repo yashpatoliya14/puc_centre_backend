@@ -16,7 +16,7 @@ import { ScannerService, ExtractedPucData } from './scanner.service';
 import { DatabaseService } from '../../db/database.service';
 import { getIstDateString } from '../../common/ist-date.util';
 
-@Controller('scanner')
+@Controller(['api/scanner', 'scanner'])
 export class ScannerController {
   private readonly logger = new Logger(ScannerController.name);
 
