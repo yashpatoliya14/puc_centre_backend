@@ -209,7 +209,6 @@ export class WhatsAppController {
       [tenantId, limit],
     );
 
-    const dailyLimit = Math.max(1, Number(tenant?.daily_message_limit || 100));
     const sentToday = Number(counts?.sent_today || 0);
     let deliveryTimes: string[] = ['10:00'];
     try {
@@ -221,13 +220,12 @@ export class WhatsAppController {
       ok: true,
       summary: {
         messagesEnabled: toBool(tenant?.messages_enabled ?? true),
-        dailyLimit,
         sentToday,
         failedToday: Number(counts?.failed_today || 0),
-        remainingToday: Math.max(0, dailyLimit - sentToday),
         frequencyCount: Number(tenant?.delivery_frequency_count || 1),
         deliveryTimes,
         todayIst,
+        unlimited: true,
       },
       items,
     };

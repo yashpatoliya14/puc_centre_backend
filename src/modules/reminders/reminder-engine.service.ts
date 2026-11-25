@@ -428,18 +428,6 @@ export class ReminderEngineService implements OnModuleDestroy {
             continue;
           }
 
-          const dailyLimit = Math.max(1, Number(tenant.daily_message_limit || 100));
-          const sentRow = await this.db.queryOne<{ cnt: number }>(
-            `SELECT COUNT(*) as cnt FROM whatsapp_logs
-             WHERE tenant_id = ? AND dispatch_date_ist = ? AND status = 'sent' AND slot_time != 'manual'`,
-            [tenant.id, todayIst],
-          );
-          let remainingQuota = dailyLimit - Number(sentRow?.cnt || 0);
-          if (remainingQuota <= 0) {
-            limitReached++;
-            continue;
-          }
-
           const slots = this.parseDeliverySlots(tenant.delivery_times, tenant.delivery_frequency_count);
           const dueSlots = slots.filter((s) => parseHHMM(s) <= nowMinutes);
           const activeSlots =
@@ -569,10 +557,7 @@ export class ReminderEngineService implements OnModuleDestroy {
           candidates.sort((a, b) => Math.abs(a.offsetDays) - Math.abs(b.offsetDays) || a.offsetDays - b.offsetDays);
 
           for (const slotTime of activeSlots) {
-            if (remainingQuota <= 0) break;
-
             for (const item of candidates) {
-              if (remainingQuota <= 0) break;
 
               const alreadyHandled = await this.db.queryOne<{ id: string }>(
                 `SELECT id FROM whatsapp_logs
@@ -649,7 +634,6 @@ export class ReminderEngineService implements OnModuleDestroy {
                 });
 
                 sent++;
-                remainingQuota--;
               } catch (err) {
                 const errMsg = err instanceof Error ? err.message : 'WhatsApp send failed';
                 await this.db.execute(
