@@ -35,6 +35,8 @@ export interface TenantRow {
   retry_interval_minutes: number;
   max_calls_per_customer: number;
   max_messages_per_customer?: number;
+  daily_message_limit?: number;
+  delivery_frequency?: string;
   calls_enabled?: number | boolean;
   auto_call_on_registration?: number | boolean;
   messages_enabled?: number | boolean;

@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS tenants (
   retry_interval_minutes INTEGER NOT NULL DEFAULT 60,
   max_calls_per_customer INTEGER NOT NULL DEFAULT 6,
   max_messages_per_customer INTEGER NOT NULL DEFAULT 3,
+  daily_message_limit INTEGER NOT NULL DEFAULT 100,
+  delivery_frequency TEXT NOT NULL DEFAULT 'hourly',
   calls_enabled INTEGER NOT NULL DEFAULT 1,
   messages_enabled INTEGER NOT NULL DEFAULT 1,
   remind_days_before TEXT NOT NULL DEFAULT '[7,3,0]',
@@ -397,6 +399,8 @@ export class DatabaseService implements OnModuleDestroy {
           ALTER TABLE tenants ADD COLUMN IF NOT EXISTS auto_call_on_registration BOOLEAN NOT NULL DEFAULT TRUE;
           ALTER TABLE tenants ADD COLUMN IF NOT EXISTS messages_enabled BOOLEAN NOT NULL DEFAULT TRUE;
           ALTER TABLE tenants ADD COLUMN IF NOT EXISTS max_messages_per_customer INTEGER NOT NULL DEFAULT 3;
+          ALTER TABLE tenants ADD COLUMN IF NOT EXISTS daily_message_limit INTEGER NOT NULL DEFAULT 100;
+          ALTER TABLE tenants ADD COLUMN IF NOT EXISTS delivery_frequency TEXT NOT NULL DEFAULT 'hourly';
           ALTER TABLE tenants ADD COLUMN IF NOT EXISTS remind_days_before TEXT NOT NULL DEFAULT '[7,3,0]';
           ALTER TABLE tenants ADD COLUMN IF NOT EXISTS remind_days_after TEXT NOT NULL DEFAULT '[1,3]';
           ALTER TABLE tenants ADD COLUMN IF NOT EXISTS puc_message_template TEXT;
@@ -439,6 +443,8 @@ export class DatabaseService implements OnModuleDestroy {
       "ALTER TABLE tenants ADD COLUMN auto_call_on_registration INTEGER NOT NULL DEFAULT 1",
       "ALTER TABLE tenants ADD COLUMN messages_enabled INTEGER NOT NULL DEFAULT 1",
       "ALTER TABLE tenants ADD COLUMN max_messages_per_customer INTEGER NOT NULL DEFAULT 3",
+      "ALTER TABLE tenants ADD COLUMN daily_message_limit INTEGER NOT NULL DEFAULT 100",
+      "ALTER TABLE tenants ADD COLUMN delivery_frequency TEXT NOT NULL DEFAULT 'hourly'",
       "ALTER TABLE tenants ADD COLUMN remind_days_before TEXT NOT NULL DEFAULT '[7,3,0]'",
       "ALTER TABLE tenants ADD COLUMN remind_days_after TEXT NOT NULL DEFAULT '[1,3]'",
       "ALTER TABLE tenants ADD COLUMN puc_message_template TEXT",
