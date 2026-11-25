@@ -16,6 +16,7 @@ import { ScannerController } from './modules/scanner/scanner.controller';
 import { ScannerService } from './modules/scanner/scanner.service';
 import { WhatsAppController } from './modules/whatsapp/whatsapp.controller';
 import { WhatsAppService } from './modules/whatsapp/whatsapp.service';
+import { EmailService } from './modules/email/email.service';
 
 @Module({
   controllers: [
@@ -39,6 +40,7 @@ import { WhatsAppService } from './modules/whatsapp/whatsapp.service';
     AdminRoleGuard,
     ScannerService,
     WhatsAppService,
+    EmailService,
   ],
 })
 export class AppModule {}

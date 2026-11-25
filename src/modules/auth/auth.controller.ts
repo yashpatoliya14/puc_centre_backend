@@ -29,6 +29,7 @@ import { AuditService } from '../audit/audit.service';
 import { SeedService, DEMO_EMAIL, DEMO_PASSWORD } from './seed.service';
 import { TenantAuthGuard, type AuthenticatedRequest } from './auth.guard';
 import { ReminderEngineService } from '../reminders/reminder-engine.service';
+import { EmailService } from '../email/email.service';
 
 const registerSchema = z.object({
   businessName: z.string().min(2, 'Business name is required').max(120),
@@ -46,7 +47,8 @@ const loginSchema = z.object({
 });
 
 const resetPasswordSchema = z.object({
-  token: z.string().min(10),
+  email: z.string().email().optional(),
+  token: z.string().min(6, 'Reset code must be at least 6 characters').max(128),
   newPassword: z.string().min(10, 'Password must be at least 10 characters').max(100),
 });
 
@@ -62,7 +64,12 @@ export class AuthController {
     @Inject(SeedService) private readonly seedService: SeedService,
     @Inject(AuditService) private readonly auditService: AuditService,
     @Inject(ReminderEngineService) private readonly reminderEngine: ReminderEngineService,
+    @Inject(EmailService) private readonly emailService: EmailService,
   ) {}
+
+  private generateSixDigitCode(): string {
+    return crypto.randomInt(100000, 999999).toString();
+  }
 
   private async createSession(user: UserRow, req: AuthenticatedRequest): Promise<string> {
     const sessionId = crypto.randomUUID();
@@ -171,7 +178,9 @@ export class AuthController {
     const tenantId = crypto.randomUUID();
     const userId = crypto.randomUUID();
     const nowIso = new Date().toISOString();
-    const verificationToken = generateToken(32);
+    const verificationCode = this.emailService.isConfigured()
+      ? this.generateSixDigitCode()
+      : generateToken(32);
     const normalizedPhone = normalizeIndianPhone(data.mobileNumber);
 
     await this.db.execute(
@@ -183,16 +192,13 @@ export class AuthController {
     await this.db.execute(
       `INSERT INTO users (id, tenant_id, email, full_name, mobile_number, password_hash, role, email_verified, verification_token, theme_preference, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, 'owner', ?, ?, 'dark', ?, ?)`,
-      [userId, tenantId, email, data.ownerName.trim(), normalizedPhone, hashPassword(data.password), false, verificationToken, nowIso, nowIso],
+      [userId, tenantId, email, data.ownerName.trim(), normalizedPhone, hashPassword(data.password), false, verificationCode, nowIso, nowIso],
     );
 
     const resources = await this.seedService.createDefaultTenantResources(tenantId, data.businessName.trim());
     if (data.preloadSampleData) {
       await this.seedService.seedSampleCentreData(tenantId, userId, resources);
     }
-
-    const user = (await this.db.queryOne<UserRow>(`SELECT * FROM users WHERE id = ?`, [userId]))!;
-    const token = await this.createSession(user, req);
 
     await this.auditService.log({
       tenantId,
@@ -203,10 +209,35 @@ export class AuthController {
       ipAddress: req.ip,
     });
 
+    if (this.emailService.isConfigured()) {
+      try {
+        await this.emailService.sendVerificationEmail({
+          to: email,
+          ownerName: data.ownerName.trim(),
+          businessName: data.businessName.trim(),
+          code: verificationCode,
+        });
+      } catch (err) {
+        // Clean up freshly created unverified account if SMTP email delivery fails
+        await this.db.execute(`DELETE FROM tenants WHERE id = ?`, [tenantId]).catch(() => {});
+        throw err;
+      }
+
+      return {
+        requiresVerification: true,
+        email,
+        businessName: data.businessName.trim(),
+        message: 'Account created! Enter the 6-digit verification code sent to your email.',
+      };
+    }
+
+    const user = (await this.db.queryOne<UserRow>(`SELECT * FROM users WHERE id = ?`, [userId]))!;
+    const token = await this.createSession(user, req);
     const profile = await this.buildAuthPayload(userId, tenantId);
     return {
+      requiresVerification: false,
       token,
-      verificationToken,
+      verificationToken: verificationCode,
       ...profile,
     };
   }
@@ -235,6 +266,34 @@ export class AuthController {
     }
     if (toBool(tenant.is_blocked) && user.role !== 'admin') {
       throw new ForbiddenException('Your PUC centre account has been blocked by the administrator.');
+    }
+    if (
+      user.role === 'owner' &&
+      !toBool(user.email_verified) &&
+      !user.last_login_at &&
+      this.emailService.isConfigured()
+    ) {
+      const code = this.generateSixDigitCode();
+      await this.db.execute(
+        `UPDATE users SET verification_token = ?, updated_at = ? WHERE id = ?`,
+        [code, new Date().toISOString(), user.id],
+      );
+      const tRow = await this.db.queryOne<{ business_name: string }>(
+        `SELECT business_name FROM tenants WHERE id = ?`,
+        [user.tenant_id],
+      );
+      await this.emailService.sendVerificationEmail({
+        to: user.email,
+        ownerName: user.full_name,
+        businessName: tRow?.business_name || 'PUC Centre',
+        code,
+      });
+      throw new ForbiddenException({
+        message: 'Please verify your email address first. A 6-digit verification code has been sent to your email.',
+        code: 'EMAIL_NOT_VERIFIED',
+        requiresVerification: true,
+        email: user.email,
+      });
     }
 
     const token = await this.createSession(user, req);
@@ -284,19 +343,81 @@ export class AuthController {
   }
 
   @Post('verify-email')
-  async verifyEmail(@Body() body: { token?: string }) {
-    const token = String(body?.token || '').trim();
-    if (!token) throw new BadRequestException('Verification token is required');
-    const user = await this.db.queryOne<UserRow>(
-      `SELECT * FROM users WHERE verification_token = ? AND deleted_at IS NULL`,
-      [token],
-    );
-    if (!user) throw new BadRequestException('Invalid or already used verification token');
+  async verifyEmail(
+    @Body() body: { email?: string; token?: string; code?: string },
+    @Req() req: AuthenticatedRequest,
+  ) {
+    const verificationCode = String(body?.code || body?.token || '').trim();
+    const email = String(body?.email || '').trim().toLowerCase();
+    if (!verificationCode) throw new BadRequestException('Verification code is required');
+
+    const user = email
+      ? await this.db.queryOne<UserRow>(
+          `SELECT * FROM users WHERE LOWER(email) = ? AND verification_token = ? AND deleted_at IS NULL`,
+          [email, verificationCode],
+        )
+      : await this.db.queryOne<UserRow>(
+          `SELECT * FROM users WHERE verification_token = ? AND deleted_at IS NULL`,
+          [verificationCode],
+        );
+
+    if (!user) throw new BadRequestException('Invalid or expired verification code');
+
     await this.db.execute(
       `UPDATE users SET email_verified = ?, verification_token = NULL, updated_at = ? WHERE id = ?`,
       [true, new Date().toISOString(), user.id],
     );
-    return { ok: true, message: 'Email verified successfully.' };
+
+    const token = await this.createSession(user, req);
+    await this.auditService.log({
+      tenantId: user.tenant_id,
+      userId: user.id,
+      action: 'auth.email_verified',
+      entityType: 'user',
+      entityId: user.id,
+      ipAddress: req.ip,
+    });
+    const profile = await this.buildAuthPayload(user.id, user.tenant_id);
+    return { ok: true, message: 'Email verified successfully.', token, ...profile };
+  }
+
+  @Post('resend-verification')
+  async resendVerification(@Body() body: { email?: string }) {
+    const email = String(body?.email || '').trim().toLowerCase();
+    if (!email) throw new BadRequestException('Email is required');
+    const user = await this.db.queryOne<UserRow>(
+      `SELECT * FROM users WHERE LOWER(email) = ? AND deleted_at IS NULL`,
+      [email],
+    );
+    if (!user) {
+      return { ok: true, message: 'If an unverified account matches that email, a verification code has been sent.' };
+    }
+    if (toBool(user.email_verified)) {
+      return { ok: true, alreadyVerified: true, message: 'Email is already verified. Please sign in.' };
+    }
+    const tenant = await this.db.queryOne<{ business_name: string }>(
+      `SELECT business_name FROM tenants WHERE id = ?`,
+      [user.tenant_id],
+    );
+    const code = this.generateSixDigitCode();
+    await this.db.execute(
+      `UPDATE users SET verification_token = ?, updated_at = ? WHERE id = ?`,
+      [code, new Date().toISOString(), user.id],
+    );
+    if (this.emailService.isConfigured()) {
+      await this.emailService.sendVerificationEmail({
+        to: user.email,
+        ownerName: user.full_name,
+        businessName: tenant?.business_name || 'PUC Centre',
+        code,
+      });
+      return { ok: true, message: 'A new 6-digit verification code has been sent to your email.' };
+    }
+    return {
+      ok: true,
+      message: 'Verification code regenerated (configure BREVO_SMTP_USER to send via Brevo email).',
+      previewVerificationCode: process.env.NODE_ENV === 'production' ? undefined : code,
+    };
   }
 
   @Post('forgot-password')
@@ -304,24 +425,41 @@ export class AuthController {
     const email = String(body?.email || '').trim().toLowerCase();
     if (!email) throw new BadRequestException('Email is required');
     const user = await this.db.queryOne<UserRow>(
-      `SELECT * FROM users WHERE email = ? AND deleted_at IS NULL`,
+      `SELECT * FROM users WHERE LOWER(email) = ? AND deleted_at IS NULL`,
       [email],
     );
     if (!user) {
-      // Do not reveal account existence in production responses
-      return { ok: true, message: 'If an account matches that email, a password reset token has been issued.' };
+      return {
+        ok: true,
+        emailSent: this.emailService.isConfigured(),
+        message: 'If an account matches that email, a password reset code has been sent.',
+      };
     }
-    const resetToken = generateToken(32);
+    const resetCode = this.emailService.isConfigured() ? this.generateSixDigitCode() : generateToken(32);
     const expiresAt = new Date(Date.now() + 30 * 60_000).toISOString();
     await this.db.execute(
       `UPDATE users SET reset_token = ?, reset_token_expires_at = ?, updated_at = ? WHERE id = ?`,
-      [resetToken, expiresAt, new Date().toISOString(), user.id],
+      [resetCode, expiresAt, new Date().toISOString(), user.id],
     );
+
+    if (this.emailService.isConfigured()) {
+      await this.emailService.sendPasswordResetEmail({
+        to: user.email,
+        ownerName: user.full_name,
+        code: resetCode,
+      });
+      return {
+        ok: true,
+        emailSent: true,
+        message: 'A 6-digit password reset code has been sent to your email (valid for 30 minutes).',
+      };
+    }
+
     return {
       ok: true,
-      message: 'Password reset token generated (valid for 30 minutes).',
-      // Returned in preview/dev mode so the flow is testable without SMTP configured
-      previewResetToken: process.env.NODE_ENV === 'production' ? undefined : resetToken,
+      emailSent: false,
+      message: 'Password reset code generated (configure BREVO_SMTP_USER to send via Brevo email).',
+      previewResetToken: process.env.NODE_ENV === 'production' ? undefined : resetCode,
     };
   }
 
@@ -333,12 +471,18 @@ export class AuthController {
     }
     const pwdError = validateStrongPassword(parsed.data.newPassword);
     if (pwdError) throw new BadRequestException(pwdError);
-    const user = await this.db.queryOne<UserRow>(
-      `SELECT * FROM users WHERE reset_token = ? AND deleted_at IS NULL`,
-      [parsed.data.token],
-    );
+    const email = parsed.data.email?.trim().toLowerCase();
+    const user = email
+      ? await this.db.queryOne<UserRow>(
+          `SELECT * FROM users WHERE LOWER(email) = ? AND reset_token = ? AND deleted_at IS NULL`,
+          [email, parsed.data.token.trim()],
+        )
+      : await this.db.queryOne<UserRow>(
+          `SELECT * FROM users WHERE reset_token = ? AND deleted_at IS NULL`,
+          [parsed.data.token.trim()],
+        );
     if (!user || !user.reset_token_expires_at || new Date(user.reset_token_expires_at).getTime() < Date.now()) {
-      throw new BadRequestException('Reset token is invalid or expired');
+      throw new BadRequestException('Reset code is invalid or expired');
     }
     const nowIso = new Date().toISOString();
     await this.db.execute(
