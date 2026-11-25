@@ -846,33 +846,81 @@ export class CustomersController {
 
     const regNo = vehicle?.registration_number || 'Vehicle';
 
+    const nowIso = new Date().toISOString();
+    const todayIst = getIstDateString();
     let sendRes: { messageId: string; template: string };
-    if (type === 'insurance') {
-      if (!insurance) {
-        throw new BadRequestException('No vehicle insurance policy found for this customer');
+    try {
+      if (type === 'insurance') {
+        if (!insurance) {
+          throw new BadRequestException('No vehicle insurance policy found for this customer');
+        }
+        sendRes = await this.whatsappService.sendInsuranceReminder({
+          to: customer.mobile_number,
+          customerName: customer.full_name,
+          vehiclePlate: regNo,
+          expiryDate: formatDdMmYyyy(insurance.expiry_date),
+          policyNumber: insurance.policy_number || 'N/A',
+          insurerName: insurance.insurance_company || 'Insurance Company',
+          centreName: tenant?.business_name || 'PUC Testing Centre',
+          ownerName: tenant?.owner_name || 'Centre Owner',
+          contactNumber: tenant?.mobile_number || 'Helpline',
+        });
+      } else {
+        sendRes = await this.whatsappService.sendPucCertificateReminder({
+          to: customer.mobile_number,
+          customerName: customer.full_name,
+          vehiclePlate: regNo,
+          expiryDate: formatDdMmYyyy(cert?.expiry_date),
+          centreName: tenant?.business_name || 'PUC Testing Centre',
+          ownerName: tenant?.owner_name || 'Centre Owner',
+          centreAddress: tenant?.address || 'Station Road',
+          contactNumber: tenant?.mobile_number || 'Helpline',
+        });
       }
-      sendRes = await this.whatsappService.sendInsuranceReminder({
-        to: customer.mobile_number,
-        customerName: customer.full_name,
-        vehiclePlate: regNo,
-        expiryDate: formatDdMmYyyy(insurance.expiry_date),
-        policyNumber: insurance.policy_number || 'N/A',
-        insurerName: insurance.insurance_company || 'Insurance Company',
-        centreName: tenant?.business_name || 'PUC Testing Centre',
-        ownerName: tenant?.owner_name || 'Centre Owner',
-        contactNumber: tenant?.mobile_number || 'Helpline',
-      });
-    } else {
-      sendRes = await this.whatsappService.sendPucCertificateReminder({
-        to: customer.mobile_number,
-        customerName: customer.full_name,
-        vehiclePlate: regNo,
-        expiryDate: formatDdMmYyyy(cert?.expiry_date),
-        centreName: tenant?.business_name || 'PUC Testing Centre',
-        ownerName: tenant?.owner_name || 'Centre Owner',
-        centreAddress: tenant?.address || 'Station Road',
-        contactNumber: tenant?.mobile_number || 'Helpline',
-      });
+
+      await this.db.execute(
+        `INSERT INTO whatsapp_logs (id, tenant_id, customer_id, vehicle_id, entity_type, entity_id, reminder_offset_days, dispatch_date_ist, slot_time, template_name, phone_number, provider_message_id, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'manual', ?, ?, ?, 'sent', ?)`,
+        [
+          crypto.randomUUID(),
+          tenantId,
+          customer.id,
+          vehicle?.id || null,
+          type,
+          cert?.expiry_date || customer.id,
+          todayIst,
+          sendRes.template,
+          customer.mobile_number,
+          sendRes.messageId,
+          nowIso,
+        ],
+      );
+    } catch (err) {
+      if (!(err instanceof BadRequestException)) {
+        const errMsg = err instanceof Error ? err.message : 'Failed to send';
+        const tplName =
+          type === 'insurance'
+            ? process.env.WHATSAPP_INSURANCE_TEMPLATE_NAME?.trim() || 'vehicle_insurance'
+            : process.env.WHATSAPP_TEMPLATE_NAME?.trim() || 'puc_certificate_utility';
+        await this.db.execute(
+          `INSERT INTO whatsapp_logs (id, tenant_id, customer_id, vehicle_id, entity_type, entity_id, reminder_offset_days, dispatch_date_ist, slot_time, template_name, phone_number, status, error_message, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'manual', ?, ?, 'failed', ?, ?)`,
+          [
+            crypto.randomUUID(),
+            tenantId,
+            customer.id,
+            vehicle?.id || null,
+            type,
+            customer.id,
+            todayIst,
+            tplName,
+            customer.mobile_number,
+            errMsg.slice(0, 500),
+            nowIso,
+          ],
+        ).catch(() => {});
+      }
+      throw err;
     }
 
     await this.auditService.log({

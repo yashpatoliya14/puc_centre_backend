@@ -320,6 +320,26 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_audit_logs_tenant_created ON audit_logs(tenant_id, created_at);
+
+CREATE TABLE IF NOT EXISTS whatsapp_logs (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+  vehicle_id TEXT,
+  entity_type TEXT NOT NULL DEFAULT 'puc',
+  entity_id TEXT NOT NULL,
+  reminder_offset_days INTEGER NOT NULL DEFAULT 0,
+  dispatch_date_ist TEXT NOT NULL,
+  slot_time TEXT NOT NULL,
+  template_name TEXT NOT NULL,
+  phone_number TEXT NOT NULL,
+  provider_message_id TEXT,
+  status TEXT NOT NULL DEFAULT 'sent',
+  error_message TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_whatsapp_logs_tenant_day ON whatsapp_logs(tenant_id, dispatch_date_ist, status);
+CREATE INDEX IF NOT EXISTS idx_whatsapp_logs_dedupe ON whatsapp_logs(tenant_id, entity_type, entity_id, dispatch_date_ist, slot_time);
 `;
 
 function convertPlaceholdersToPg(sql: string): string {
@@ -412,6 +432,25 @@ export class DatabaseService implements OnModuleDestroy {
           ALTER TABLE tenants ADD COLUMN IF NOT EXISTS voice_script_template TEXT;
           ALTER TABLE tenants ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN NOT NULL DEFAULT FALSE;
           ALTER TABLE tenants ADD COLUMN IF NOT EXISTS blocked_at TIMESTAMPTZ;
+          CREATE TABLE IF NOT EXISTS whatsapp_logs (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+            customer_id TEXT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+            vehicle_id TEXT,
+            entity_type TEXT NOT NULL DEFAULT 'puc',
+            entity_id TEXT NOT NULL,
+            reminder_offset_days INTEGER NOT NULL DEFAULT 0,
+            dispatch_date_ist TEXT NOT NULL,
+            slot_time TEXT NOT NULL,
+            template_name TEXT NOT NULL,
+            phone_number TEXT NOT NULL,
+            provider_message_id TEXT,
+            status TEXT NOT NULL DEFAULT 'sent',
+            error_message TEXT,
+            created_at TEXT NOT NULL DEFAULT NOW()::text
+          );
+          CREATE INDEX IF NOT EXISTS idx_whatsapp_logs_tenant_day ON whatsapp_logs(tenant_id, dispatch_date_ist, status);
+          CREATE INDEX IF NOT EXISTS idx_whatsapp_logs_dedupe ON whatsapp_logs(tenant_id, entity_type, entity_id, dispatch_date_ist, slot_time);
         `);
         this.engine = 'supabase-postgresql';
         this.initialized = true;

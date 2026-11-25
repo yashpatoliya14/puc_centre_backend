@@ -4,11 +4,15 @@ import { Queue, Worker } from 'bullmq';
 import { DatabaseService } from '../../db/database.service';
 import { CallingService, renderVoiceTemplate } from '../telephony/calling.service';
 import { AuditService } from '../audit/audit.service';
+import { WhatsAppService } from '../whatsapp/whatsapp.service';
 import {
   computeReminderScheduledIso,
+  diffDays,
   formatReadableDate,
   getIstDateString,
+  getIstParts,
   isWithinCallingWindow,
+  parseHHMM,
 } from '../../common/ist-date.util';
 import {
   DEFAULT_ENGLISH_TEMPLATE,
@@ -66,12 +70,16 @@ export class ReminderEngineService implements OnModuleDestroy {
   private bullQueue: Queue | null = null;
   private bullWorker: Worker | null = null;
   private schedulerInterval: NodeJS.Timeout | null = null;
+  private startupWhatsAppTimer: NodeJS.Timeout | null = null;
+  private whatsappCycleRunning = false;
+  private runningWhatsAppTenants = new Set<string>();
   private simulatedTimers = new Set<NodeJS.Timeout>();
 
   constructor(
     @Inject(DatabaseService) private readonly db: DatabaseService,
     @Inject(CallingService) private readonly callingService: CallingService,
     @Inject(AuditService) private readonly auditService: AuditService,
+    @Inject(WhatsAppService) private readonly whatsappService: WhatsAppService,
   ) {}
 
   startBackgroundLoops(): void {
@@ -101,12 +109,24 @@ export class ReminderEngineService implements OnModuleDestroy {
     }
 
     if (!this.schedulerInterval) {
-      // Run background scheduler every 60s
+      // Run background call + WhatsApp scheduler every 60s
       this.schedulerInterval = setInterval(() => {
         this.runSchedulerCycle(undefined, { ignoreWindow: false }).catch((err) => {
           console.error('[ReminderEngine] Background tick failed:', err);
         });
+        this.runWhatsAppSchedulerCycle(undefined, { ignoreWindow: false }).catch((err) => {
+          console.error('[ReminderEngine] WhatsApp background tick failed:', err);
+        });
       }, 60_000);
+    }
+
+    if (!this.startupWhatsAppTimer) {
+      this.startupWhatsAppTimer = setTimeout(() => {
+        this.startupWhatsAppTimer = null;
+        this.runWhatsAppSchedulerCycle(undefined, { ignoreWindow: false }).catch((err) => {
+          console.error('[ReminderEngine] Initial WhatsApp tick failed:', err);
+        });
+      }, 5_000);
     }
   }
 
@@ -116,6 +136,7 @@ export class ReminderEngineService implements OnModuleDestroy {
 
   async onModuleDestroy(): Promise<void> {
     if (this.schedulerInterval) clearInterval(this.schedulerInterval);
+    if (this.startupWhatsAppTimer) clearTimeout(this.startupWhatsAppTimer);
     for (const timer of this.simulatedTimers) clearTimeout(timer);
     this.simulatedTimers.clear();
     if (this.bullWorker) await this.bullWorker.close().catch(() => {});
@@ -313,6 +334,373 @@ export class ReminderEngineService implements OnModuleDestroy {
     }
 
     return { scanned, dispatched, skipped, deferredWindow };
+  }
+
+  private parseNumberList(raw: string | undefined, fallback: number[]): number[] {
+    if (!raw) return fallback;
+    try {
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return fallback;
+      return parsed.map((n) => Number(n)).filter((n) => Number.isFinite(n));
+    } catch {
+      return fallback;
+    }
+  }
+
+  private parseDeliverySlots(rawTimes: string | undefined, countRaw: number | undefined): string[] {
+    const count = Math.min(24, Math.max(1, Number(countRaw || 1)));
+    let list: string[] = ['10:00'];
+    if (rawTimes) {
+      try {
+        const parsed = JSON.parse(rawTimes);
+        if (Array.isArray(parsed)) {
+          const valid = parsed
+            .map((t) => String(t || '').trim())
+            .filter((t) => /^\d{2}:\d{2}$/.test(t));
+          if (valid.length > 0) list = valid;
+        }
+      } catch {}
+    }
+    return Array.from(new Set(list.slice(0, count))).sort((a, b) => parseHHMM(a) - parseHHMM(b));
+  }
+
+  private formatDdMmYyyy(dateStr?: string | null): string {
+    if (!dateStr) return 'Soon';
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr.trim());
+    return match ? `${match[3]}/${match[2]}/${match[1]}` : dateStr;
+  }
+
+  /**
+   * Settings-driven WhatsApp Reminder Engine:
+   * Evaluates messages_enabled, delivery_times/delivery_frequency_count (IST),
+   * remind_days_before/remind_days_after, and daily_message_limit per tenant.
+   */
+  async runWhatsAppSchedulerCycle(
+    tenantIdFilter?: string,
+    options: { now?: Date; forceImmediate?: boolean; ignoreWindow?: boolean } = {},
+  ): Promise<{
+    checkedTenants: number;
+    sent: number;
+    failed: number;
+    skipped: number;
+    deferredTime: number;
+    limitReached: number;
+  }> {
+    if (!tenantIdFilter) {
+      if (this.whatsappCycleRunning) {
+        return { checkedTenants: 0, sent: 0, failed: 0, skipped: 0, deferredTime: 0, limitReached: 0 };
+      }
+      this.whatsappCycleRunning = true;
+    } else {
+      // Wait briefly if this specific tenant is mid-dispatch so manual runs never silently no-op
+      for (let i = 0; i < 20 && this.runningWhatsAppTenants.has(tenantIdFilter); i++) {
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      if (this.runningWhatsAppTenants.has(tenantIdFilter)) {
+        return { checkedTenants: 0, sent: 0, failed: 0, skipped: 0, deferredTime: 0, limitReached: 0 };
+      }
+    }
+
+    const now = options.now ?? new Date();
+    const istParts = getIstParts(now);
+    const todayIst = istParts.dateStr;
+    const nowMinutes = istParts.minutesSinceMidnight;
+
+    let checkedTenants = 0;
+    let sent = 0;
+    let failed = 0;
+    let skipped = 0;
+    let deferredTime = 0;
+    let limitReached = 0;
+
+    try {
+      const tenants = tenantIdFilter
+        ? await this.db.query<TenantRow>(`SELECT * FROM tenants WHERE id = ? AND deleted_at IS NULL`, [tenantIdFilter])
+        : await this.db.query<TenantRow>(`SELECT * FROM tenants WHERE deleted_at IS NULL`);
+
+      for (const tenant of tenants) {
+        if (this.runningWhatsAppTenants.has(tenant.id)) continue;
+        this.runningWhatsAppTenants.add(tenant.id);
+        try {
+          checkedTenants++;
+          if (toBool(tenant.is_blocked) || !toBool(tenant.messages_enabled ?? true)) {
+            skipped++;
+            continue;
+          }
+
+          const dailyLimit = Math.max(1, Number(tenant.daily_message_limit || 100));
+          const sentRow = await this.db.queryOne<{ cnt: number }>(
+            `SELECT COUNT(*) as cnt FROM whatsapp_logs
+             WHERE tenant_id = ? AND dispatch_date_ist = ? AND status = 'sent' AND slot_time != 'manual'`,
+            [tenant.id, todayIst],
+          );
+          let remainingQuota = dailyLimit - Number(sentRow?.cnt || 0);
+          if (remainingQuota <= 0) {
+            limitReached++;
+            continue;
+          }
+
+          const slots = this.parseDeliverySlots(tenant.delivery_times, tenant.delivery_frequency_count);
+          const dueSlots = slots.filter((s) => parseHHMM(s) <= nowMinutes);
+          const activeSlots =
+            dueSlots.length > 0
+              ? dueSlots
+              : options.forceImmediate
+                ? [slots[0] || 'immediate']
+                : [];
+
+          if (activeSlots.length === 0) {
+            deferredTime++;
+            continue;
+          }
+
+          const daysBefore = this.parseNumberList(tenant.remind_days_before, [7, 3, 0]);
+          const daysAfter = this.parseNumberList(tenant.remind_days_after, [1, 3]);
+          const offsetSet = new Set<number>([
+            ...daysBefore.map((d) => Math.abs(d)),
+            ...daysAfter.map((d) => -Math.abs(d)),
+          ]);
+
+          if (offsetSet.size === 0) {
+            skipped++;
+            continue;
+          }
+
+          type Candidate = {
+            entityType: 'puc' | 'insurance';
+            entityId: string;
+            customerId: string;
+            vehicleId: string;
+            customerName: string;
+            mobileNumber: string;
+            vehiclePlate: string;
+            expiryDate: string;
+            offsetDays: number;
+            policyNumber?: string;
+            insurerName?: string;
+          };
+
+          const candidates: Candidate[] = [];
+
+          const pucRows = await this.db.query<{
+            entity_id: string;
+            customer_id: string;
+            vehicle_id: string;
+            full_name: string;
+            mobile_number: string;
+            registration_number: string;
+            expiry_date: string;
+          }>(
+            `SELECT pc.id as entity_id, c.id as customer_id, v.id as vehicle_id,
+                    c.full_name, c.mobile_number, v.registration_number, pc.expiry_date
+             FROM puc_certificates pc
+             INNER JOIN customers c ON c.id = pc.customer_id
+             INNER JOIN vehicles v ON v.id = pc.vehicle_id
+             WHERE pc.tenant_id = ? AND pc.is_current = ? AND pc.cycle_status != 'renewed'
+               AND pc.deleted_at IS NULL AND c.deleted_at IS NULL AND v.deleted_at IS NULL
+               AND c.status = 'active' AND c.consent_given = ? AND c.reminders_enabled = ?`,
+            [tenant.id, true, true, true],
+          );
+
+          for (const r of pucRows) {
+            if (!r.expiry_date) continue;
+            const daysUntil = diffDays(todayIst, r.expiry_date);
+            if (!offsetSet.has(daysUntil)) continue;
+            candidates.push({
+              entityType: 'puc',
+              entityId: r.entity_id,
+              customerId: r.customer_id,
+              vehicleId: r.vehicle_id,
+              customerName: r.full_name,
+              mobileNumber: r.mobile_number,
+              vehiclePlate: r.registration_number,
+              expiryDate: r.expiry_date,
+              offsetDays: daysUntil,
+            });
+          }
+
+          const insRows = await this.db.query<{
+            entity_id: string;
+            customer_id: string;
+            vehicle_id: string;
+            full_name: string;
+            mobile_number: string;
+            registration_number: string;
+            expiry_date: string;
+            policy_number: string;
+            insurance_company: string;
+          }>(
+            `SELECT vi.id as entity_id, c.id as customer_id, v.id as vehicle_id,
+                    c.full_name, c.mobile_number, v.registration_number, vi.expiry_date,
+                    vi.policy_number, vi.insurance_company
+             FROM vehicle_insurances vi
+             INNER JOIN customers c ON c.id = vi.customer_id
+             INNER JOIN vehicles v ON v.id = vi.vehicle_id
+             WHERE vi.tenant_id = ? AND vi.status = 'active'
+               AND vi.deleted_at IS NULL AND c.deleted_at IS NULL AND v.deleted_at IS NULL
+               AND c.status = 'active' AND c.consent_given = ? AND c.reminders_enabled = ?`,
+            [tenant.id, true, true],
+          );
+
+          for (const r of insRows) {
+            if (!r.expiry_date) continue;
+            const daysUntil = diffDays(todayIst, r.expiry_date);
+            if (!offsetSet.has(daysUntil)) continue;
+            candidates.push({
+              entityType: 'insurance',
+              entityId: r.entity_id,
+              customerId: r.customer_id,
+              vehicleId: r.vehicle_id,
+              customerName: r.full_name,
+              mobileNumber: r.mobile_number,
+              vehiclePlate: r.registration_number,
+              expiryDate: r.expiry_date,
+              offsetDays: daysUntil,
+              policyNumber: r.policy_number,
+              insurerName: r.insurance_company,
+            });
+          }
+
+          if (candidates.length === 0) {
+            continue;
+          }
+
+          // Prioritize due-today (0), most recent overdue, and closest upcoming expiry
+          candidates.sort((a, b) => Math.abs(a.offsetDays) - Math.abs(b.offsetDays) || a.offsetDays - b.offsetDays);
+
+          for (const slotTime of activeSlots) {
+            if (remainingQuota <= 0) break;
+
+            for (const item of candidates) {
+              if (remainingQuota <= 0) break;
+
+              const alreadyHandled = await this.db.queryOne<{ id: string }>(
+                `SELECT id FROM whatsapp_logs
+                 WHERE tenant_id = ? AND entity_type = ? AND entity_id = ?
+                   AND dispatch_date_ist = ? AND slot_time = ?`,
+                [tenant.id, item.entityType, item.entityId, todayIst, slotTime],
+              );
+              if (alreadyHandled) continue;
+
+              const nowIso = new Date().toISOString();
+              const tplFallback =
+                item.entityType === 'insurance'
+                  ? process.env.WHATSAPP_INSURANCE_TEMPLATE_NAME?.trim() || 'vehicle_insurance'
+                  : process.env.WHATSAPP_TEMPLATE_NAME?.trim() || 'puc_certificate_utility';
+
+              try {
+                const sendRes =
+                  item.entityType === 'insurance'
+                    ? await this.whatsappService.sendInsuranceReminder({
+                        to: item.mobileNumber,
+                        customerName: item.customerName,
+                        vehiclePlate: item.vehiclePlate,
+                        expiryDate: this.formatDdMmYyyy(item.expiryDate),
+                        policyNumber: item.policyNumber || 'N/A',
+                        insurerName: item.insurerName || 'Insurance Company',
+                        centreName: tenant.business_name || 'PUC Testing Centre',
+                        ownerName: tenant.owner_name || 'Centre Owner',
+                        contactNumber: tenant.mobile_number || 'Helpline',
+                      })
+                    : await this.whatsappService.sendPucCertificateReminder({
+                        to: item.mobileNumber,
+                        customerName: item.customerName,
+                        vehiclePlate: item.vehiclePlate,
+                        expiryDate: this.formatDdMmYyyy(item.expiryDate),
+                        centreName: tenant.business_name || 'PUC Testing Centre',
+                        ownerName: tenant.owner_name || 'Centre Owner',
+                        centreAddress: tenant.address || 'Station Road',
+                        contactNumber: tenant.mobile_number || 'Helpline',
+                      });
+
+                await this.db.execute(
+                  `INSERT INTO whatsapp_logs (id, tenant_id, customer_id, vehicle_id, entity_type, entity_id, reminder_offset_days, dispatch_date_ist, slot_time, template_name, phone_number, provider_message_id, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'sent', ?)`,
+                  [
+                    crypto.randomUUID(),
+                    tenant.id,
+                    item.customerId,
+                    item.vehicleId,
+                    item.entityType,
+                    item.entityId,
+                    item.offsetDays,
+                    todayIst,
+                    slotTime,
+                    sendRes.template,
+                    item.mobileNumber,
+                    sendRes.messageId,
+                    nowIso,
+                  ],
+                );
+
+                await this.auditService.log({
+                  tenantId: tenant.id,
+                  action: 'whatsapp_reminder.auto_sent',
+                  entityType: 'customer',
+                  entityId: item.customerId,
+                  metadata: {
+                    messageId: sendRes.messageId,
+                    template: sendRes.template,
+                    reminderType: item.entityType,
+                    vehicle: item.vehiclePlate,
+                    slotTime,
+                    offsetDays: item.offsetDays,
+                  },
+                });
+
+                sent++;
+                remainingQuota--;
+              } catch (err) {
+                const errMsg = err instanceof Error ? err.message : 'WhatsApp send failed';
+                await this.db.execute(
+                  `INSERT INTO whatsapp_logs (id, tenant_id, customer_id, vehicle_id, entity_type, entity_id, reminder_offset_days, dispatch_date_ist, slot_time, template_name, phone_number, status, error_message, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'failed', ?, ?)`,
+                  [
+                    crypto.randomUUID(),
+                    tenant.id,
+                    item.customerId,
+                    item.vehicleId,
+                    item.entityType,
+                    item.entityId,
+                    item.offsetDays,
+                    todayIst,
+                    slotTime,
+                    tplFallback,
+                    item.mobileNumber,
+                    errMsg.slice(0, 500),
+                    nowIso,
+                  ],
+                );
+
+                await this.auditService.log({
+                  tenantId: tenant.id,
+                  action: 'whatsapp_reminder.auto_failed',
+                  entityType: 'customer',
+                  entityId: item.customerId,
+                  metadata: {
+                    error: errMsg,
+                    template: tplFallback,
+                    reminderType: item.entityType,
+                    vehicle: item.vehiclePlate,
+                    slotTime,
+                  },
+                });
+
+                failed++;
+              }
+            }
+          }
+        } finally {
+          this.runningWhatsAppTenants.delete(tenant.id);
+        }
+      }
+
+      return { checkedTenants, sent, failed, skipped, deferredTime, limitReached };
+    } finally {
+      if (!tenantIdFilter) {
+        this.whatsappCycleRunning = false;
+      }
+    }
   }
 
   async executeCallJob(

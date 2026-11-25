@@ -15,6 +15,7 @@ import {
 import { TenantAuthGuard, type AuthenticatedRequest } from '../auth/auth.guard';
 import { CallingService } from '../telephony/calling.service';
 import { AuditService } from '../audit/audit.service';
+import { ReminderEngineService } from '../reminders/reminder-engine.service';
 
 const simplifiedSettingsSchema = z.object({
   callsEnabled: z.boolean(),
@@ -110,6 +111,7 @@ export class SettingsController {
     @Inject(DatabaseService) private readonly db: DatabaseService,
     @Inject(CallingService) private readonly callingService: CallingService,
     @Inject(AuditService) private readonly auditService: AuditService,
+    @Inject(ReminderEngineService) private readonly reminderEngine: ReminderEngineService,
   ) {}
 
   @Get()
@@ -384,8 +386,21 @@ export class SettingsController {
       userId: req.auth!.userId,
       action: 'settings.updated',
       entityType: 'tenant',
-      metadata: { callsEnabled: d.callsEnabled, messagesEnabled: d.messagesEnabled },
+      metadata: {
+        callsEnabled: d.callsEnabled,
+        messagesEnabled: d.messagesEnabled,
+        dailyMessageLimit: d.dailyMessageLimit,
+        deliveryTimes: normalizedTimes,
+      },
     });
+
+    if (d.messagesEnabled) {
+      setImmediate(() => {
+        this.reminderEngine.runWhatsAppSchedulerCycle(tenantId, { ignoreWindow: false }).catch((err) => {
+          console.error('[Settings] Immediate WhatsApp scheduler trigger failed:', err);
+        });
+      });
+    }
 
     return { ok: true };
   }
