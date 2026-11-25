@@ -24,7 +24,9 @@ const simplifiedSettingsSchema = z.object({
   retryIntervalMinutes: z.number().int().min(5).max(1440).default(60),
   maxMessagesPerCustomer: z.number().int().min(1).max(20).default(3),
   dailyMessageLimit: z.number().int().min(1).max(10000).default(100),
-  deliveryFrequency: z.string().min(2).max(40).default('hourly'),
+  deliveryFrequency: z.string().min(2).max(40).default('1x_daily'),
+  deliveryFrequencyCount: z.number().int().min(1).max(24).default(1),
+  deliveryTimes: z.array(z.string().regex(/^\d{2}:\d{2}$/)).max(24).default(['10:00']),
   callingWindowStart: z.string().regex(/^\d{2}:\d{2}$/).default('09:30'),
   callingWindowEnd: z.string().regex(/^\d{2}:\d{2}$/).default('19:30'),
   remindDaysBefore: z.array(z.number().int().min(0).max(365)).default([7, 3, 0]),
@@ -142,7 +144,16 @@ export class SettingsController {
         retryIntervalMinutes: tenant.retry_interval_minutes || 60,
         maxMessagesPerCustomer: tenant.max_messages_per_customer || 3,
         dailyMessageLimit: tenant.daily_message_limit || 100,
-        deliveryFrequency: tenant.delivery_frequency || 'hourly',
+        deliveryFrequency: tenant.delivery_frequency || '1x_daily',
+        deliveryFrequencyCount: tenant.delivery_frequency_count || 1,
+        deliveryTimes: (() => {
+          try {
+            const parsed = JSON.parse(tenant.delivery_times || '["10:00"]');
+            return Array.isArray(parsed) && parsed.length > 0 ? parsed : ['10:00'];
+          } catch {
+            return ['10:00'];
+          }
+        })(),
         callingWindowStart: tenant.calling_window_start || '09:30',
         callingWindowEnd: tenant.calling_window_end || '19:30',
         remindDaysBefore: JSON.parse(tenant.remind_days_before || '[7,3,0]') as number[],
@@ -235,12 +246,15 @@ export class SettingsController {
 
     const daysBefore = Array.from(new Set(d.remindDaysBefore)).sort((a, b) => b - a);
     const daysAfter = Array.from(new Set(d.remindDaysAfter)).sort((a, b) => a - b);
+    const freqCount = Math.min(24, Math.max(1, d.deliveryFrequencyCount || 1));
+    const normalizedTimes = Array.from({ length: freqCount }, (_, idx) => d.deliveryTimes[idx] || '10:00');
 
     await this.db.execute(
       `UPDATE tenants
        SET calls_enabled = ?, auto_call_on_registration = ?, messages_enabled = ?, automation_enabled = ?,
            max_calls_per_customer = ?, retry_interval_minutes = ?, max_messages_per_customer = ?,
            daily_message_limit = ?, delivery_frequency = ?,
+           delivery_frequency_count = ?, delivery_times = ?,
            calling_window_start = ?, calling_window_end = ?,
            remind_days_before = ?, remind_days_after = ?,
            puc_message_template = COALESCE(?, puc_message_template),
@@ -260,7 +274,9 @@ export class SettingsController {
         d.retryIntervalMinutes,
         d.maxMessagesPerCustomer,
         d.dailyMessageLimit,
-        d.deliveryFrequency,
+        `${freqCount}x_daily`,
+        freqCount,
+        JSON.stringify(normalizedTimes),
         d.callingWindowStart,
         d.callingWindowEnd,
         JSON.stringify(daysBefore),
