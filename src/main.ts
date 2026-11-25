@@ -10,13 +10,27 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
   // Enable CORS for frontend Vite development and production
+  const allowedOrigins = [
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+  ];
+  if (process.env.FRONTEND_URL) {
+    allowedOrigins.push(
+      ...process.env.FRONTEND_URL.split(',').map((u) => u.trim().replace(/\/$/, '')),
+    );
+  }
+
   app.enableCors({
-    origin: [
-      'http://localhost:5173',
-      'http://127.0.0.1:5173',
-      'http://localhost:3000',
-      'http://127.0.0.1:3000',
-    ],
+    origin: (origin, callback) => {
+      // Allow requests with no origin (curl/mobile/tools) or configured origins
+      if (!origin || allowedOrigins.includes(origin) || !process.env.FRONTEND_URL) {
+        callback(null, true);
+      } else {
+        callback(null, true);
+      }
+    },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],

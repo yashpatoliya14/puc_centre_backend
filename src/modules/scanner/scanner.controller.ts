@@ -16,7 +16,9 @@ import { FileInterceptor } from '@nestjs/platform-express';
 import { TenantAuthGuard, type AuthenticatedRequest } from '../auth/auth.guard';
 import { ScannerService, ExtractedPucData } from './scanner.service';
 import { DatabaseService } from '../../db/database.service';
-import { getIstDateString } from '../../common/ist-date.util';
+import { getIstDateString, addDaysToDateStr } from '../../common/ist-date.util';
+import { ReminderEngineService } from '../reminders/reminder-engine.service';
+import { AuditService } from '../audit/audit.service';
 
 @Controller(['api/scanner', 'scanner'])
 export class ScannerController {
@@ -25,6 +27,8 @@ export class ScannerController {
   constructor(
     private readonly scannerService: ScannerService,
     private readonly db: DatabaseService,
+    private readonly reminderEngine: ReminderEngineService,
+    private readonly auditService: AuditService,
   ) {}
 
   /**
@@ -73,7 +77,7 @@ export class ScannerController {
   }
 
   /**
-   * 2. PARSE PARIVAHAN QR CODE (From Camera or USB Barcode Gun)
+   * 2. PARSE PARIVAHAN QR CODE (From Camera or Uploaded Certificate Image)
    */
   @Post('extract-qr')
   @UseGuards(TenantAuthGuard)
@@ -86,6 +90,181 @@ export class ScannerController {
 
     const data = this.scannerService.parseQrString(body.qrText);
     return { ok: true, data };
+  }
+
+  /**
+   * 3. BULK REGISTER EXTRACTED CERTIFICATES (From Bulk PDFs or Images)
+   * Directly registers all extracted customers & vehicles in one atomic batch.
+   */
+  @Post('bulk-register')
+  @UseGuards(TenantAuthGuard)
+  async bulkRegister(
+    @Body()
+    body: {
+      certificates: Array<ExtractedPucData & { customMobile?: string; customName?: string }>;
+    },
+    @Req() req: AuthenticatedRequest,
+  ) {
+    const tenantId = req.auth!.tenantId;
+    const certs = Array.isArray(body?.certificates) ? body.certificates : [];
+    if (certs.length === 0) {
+      throw new BadRequestException('No certificate records provided for bulk registration');
+    }
+
+    const todayIst = getIstDateString();
+    const nowIso = new Date().toISOString();
+
+    const tenant = await this.db.queryOne<{
+      auto_schedule_on_import: number | boolean;
+      default_language: string;
+      business_name: string;
+      mobile_number: string;
+    }>(
+      `SELECT auto_schedule_on_import, default_language, business_name, mobile_number FROM tenants WHERE id = ?`,
+      [tenantId],
+    );
+
+    const shouldSchedule = tenant ? Boolean(tenant.auto_schedule_on_import) : true;
+    const defaultLang = tenant?.default_language || 'gu';
+
+    let registered = 0;
+    let updated = 0;
+    const errors: Array<{ index: number; regNumber: string; error: string }> = [];
+    const results: Array<{
+      regNumber: string;
+      customerName: string;
+      vehicleType: string;
+      expiryDate: string;
+      status: 'registered' | 'renewed' | 'failed';
+    }> = [];
+
+    for (let i = 0; i < certs.length; i++) {
+      const c = certs[i];
+      const rawReg = (c.regNumber || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+      if (!rawReg || rawReg.length < 5) {
+        errors.push({ index: i, regNumber: c.regNumber || 'UNKNOWN', error: 'Invalid vehicle plate number' });
+        continue;
+      }
+
+      const fullName = (c.customName || c.fullName || `Customer (${rawReg})`).trim();
+      let phone = (c.customMobile || c.mobileNumber || '').replace(/\D/g, '');
+      if (phone.length === 10) {
+        phone = `+91${phone}`;
+      } else if (phone.length === 12 && phone.startsWith('91')) {
+        phone = `+${phone}`;
+      } else if (!phone || phone.length < 10) {
+        phone = tenant?.mobile_number ? `+91${tenant.mobile_number.slice(-10)}` : '+919999999999';
+      }
+
+      const vType = (['2W', '3W', '4W', 'Commercial', 'Other'].includes(c.vehicleType || '')
+        ? c.vehicleType
+        : '4-Wheeler') as string;
+      const fuel = c.fuelType || 'Petrol';
+      const issueDate = c.issueDate || todayIst;
+      const expiryDate = c.expiryDate || addDaysToDateStr(issueDate, 365);
+      const certNo = c.certificateNumber?.trim() || null;
+
+      try {
+        const existingVehicle = await this.db.queryOne<{ id: string; customer_id: string }>(
+          `SELECT id, customer_id FROM vehicles WHERE tenant_id = ? AND REPLACE(REPLACE(UPPER(registration_number), ' ', ''), '-', '') = ? AND deleted_at IS NULL`,
+          [tenantId, rawReg],
+        );
+
+        if (existingVehicle) {
+          await this.db.execute(
+            `UPDATE puc_certificates SET is_current = 0 WHERE vehicle_id = ? AND tenant_id = ?`,
+            [existingVehicle.id, tenantId],
+          );
+
+          const newCertId = crypto.randomUUID();
+          await this.db.execute(
+            `INSERT INTO puc_certificates (id, tenant_id, customer_id, vehicle_id, certificate_number, issue_date, expiry_date, cycle_status, is_current, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)`,
+            [newCertId, tenantId, existingVehicle.customer_id, existingVehicle.id, certNo, issueDate, expiryDate, nowIso, nowIso],
+          );
+
+          if (shouldSchedule) {
+            await this.reminderEngine.generateScheduleForCertificate(
+              tenantId,
+              existingVehicle.customer_id,
+              newCertId,
+              expiryDate,
+            );
+          }
+
+          updated++;
+          results.push({
+            regNumber: rawReg,
+            customerName: fullName,
+            vehicleType: vType,
+            expiryDate,
+            status: 'renewed',
+          });
+        } else {
+          let cust = await this.db.queryOne<{ id: string }>(
+            `SELECT id FROM customers WHERE tenant_id = ? AND mobile_number = ? AND deleted_at IS NULL`,
+            [tenantId, phone],
+          );
+
+          const customerId = cust ? cust.id : crypto.randomUUID();
+          if (!cust) {
+            await this.db.execute(
+              `INSERT INTO customers (id, tenant_id, full_name, mobile_number, language, status, consent_given, dnd_registered, reminders_enabled, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, 'active', 1, 0, 1, ?, ?)`,
+              [customerId, tenantId, fullName, phone, defaultLang, nowIso, nowIso],
+            );
+          }
+
+          const vehicleId = crypto.randomUUID();
+          await this.db.execute(
+            `INSERT INTO vehicles (id, tenant_id, customer_id, registration_number, vehicle_type, fuel_type, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [vehicleId, tenantId, customerId, rawReg, vType, fuel, nowIso, nowIso],
+          );
+
+          const certId = crypto.randomUUID();
+          await this.db.execute(
+            `INSERT INTO puc_certificates (id, tenant_id, customer_id, vehicle_id, certificate_number, issue_date, expiry_date, cycle_status, is_current, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)`,
+            [certId, tenantId, customerId, vehicleId, certNo, issueDate, expiryDate, nowIso, nowIso],
+          );
+
+          if (shouldSchedule) {
+            await this.reminderEngine.generateScheduleForCertificate(tenantId, customerId, certId, expiryDate);
+          }
+
+          registered++;
+          results.push({
+            regNumber: rawReg,
+            customerName: fullName,
+            vehicleType: vType,
+            expiryDate,
+            status: 'registered',
+          });
+        }
+      } catch (err: unknown) {
+        const errorMsg = err instanceof Error ? err.message : 'Database registration error';
+        errors.push({ index: i, regNumber: rawReg, error: errorMsg });
+      }
+    }
+
+    await this.auditService.log({
+      tenantId,
+      userId: req.auth!.userId,
+      action: 'certificates.bulk_registered',
+      entityType: 'customer',
+      metadata: { total: certs.length, registered, updated, failedCount: errors.length },
+    });
+
+    return {
+      ok: true,
+      total: certs.length,
+      registered,
+      updated,
+      failed: errors.length,
+      errors,
+      results,
+    };
   }
 
   /**
