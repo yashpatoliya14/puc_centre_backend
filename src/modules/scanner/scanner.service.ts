@@ -5,7 +5,7 @@ import { getIstDateString } from '../../common/ist-date.util';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { PDFParse } = require('pdf-parse') as {
   PDFParse: new (opts: { data: Uint8Array | Buffer }) => {
-    getText: () => Promise<{ text?: string }>;
+    getText: (params?: { cellSeparator?: string; lineEnforce?: boolean }) => Promise<{ text?: string }>;
     getScreenshot: (params?: { scale?: number; first?: number; imageBuffer?: boolean }) => Promise<{
       pages?: Array<{ data?: Uint8Array }>;
     }>;
@@ -68,7 +68,7 @@ export class ScannerService implements OnModuleDestroy {
 
     const parser = new PDFParse({ data: new Uint8Array(buffer) });
     try {
-      const parsed = await parser.getText();
+      const parsed = await parser.getText({ cellSeparator: '  ', lineEnforce: true });
       let rawText = parsed?.text || '';
 
       // Fallback for scanned / image-only PDFs where embedded text is absent
@@ -157,12 +157,19 @@ export class ScannerService implements OnModuleDestroy {
           params.get('exp') ||
           params.get('valid_upto') ||
           params.get('validUpto') ||
+          params.get('upto') ||
           params.get('validity') ||
+          params.get('expiry') ||
+          params.get('expiry_date') ||
+          params.get('valid_till') ||
+          params.get('pucc_upto') ||
+          params.get('vahan_upto') ||
           '';
 
         let issueDate =
           params.get('issue') ||
           params.get('test_date') ||
+          params.get('issue_date') ||
           params.get('date') ||
           '';
 
@@ -180,13 +187,12 @@ export class ScannerService implements OnModuleDestroy {
         fuelType = this.normalizeFuelType(fuelType);
         vehicleType = this.normalizeVehicleType(vehicleType);
 
-        const dates = this.computeDefaultDates(issueDate, expiryDate, fuelType);
-
+        // Do not invent a synthetic expiryDate if the QR URL did not contain one
         return {
           regNumber,
           certificateNumber: certificateNumber.trim(),
-          issueDate: dates.issueDate,
-          expiryDate: dates.expiryDate,
+          issueDate,
+          expiryDate,
           fuelType,
           vehicleType,
           rawText: trimmed,
@@ -202,8 +208,7 @@ export class ScannerService implements OnModuleDestroy {
       const parts = trimmed.split(/[|;]/).map((p) => p.trim());
       let regNumber = '';
       let certificateNumber = '';
-      let issueDate = '';
-      let expiryDate = '';
+      const foundDates: string[] = [];
       let fuelType = 'Petrol';
       const vehicleType = '4-Wheeler';
 
@@ -212,22 +217,25 @@ export class ScannerService implements OnModuleDestroy {
           regNumber = this.normalizeRegNumber(part);
         } else if (!certificateNumber && /^[A-Z0-9]{8,20}$/i.test(part) && !/PETROL|DIESEL|CNG/i.test(part)) {
           certificateNumber = part.toUpperCase();
-        } else if (!issueDate && /\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}/.test(part)) {
-          issueDate = this.normalizeDateString(part);
-        } else if (!expiryDate && /\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}/.test(part)) {
-          expiryDate = this.normalizeDateString(part);
-        } else if (/PETROL|DIESEL|CNG|ELECTRIC/i.test(part)) {
-          fuelType = this.normalizeFuelType(part);
+        } else {
+          const d = this.normalizeDateString(part);
+          if (d) {
+            foundDates.push(d);
+          } else if (/PETROL|DIESEL|CNG|ELECTRIC/i.test(part)) {
+            fuelType = this.normalizeFuelType(part);
+          }
         }
       }
 
-      const dates = this.computeDefaultDates(issueDate, expiryDate, fuelType);
+      foundDates.sort();
+      const issueDate = foundDates.length >= 2 ? foundDates[0] : '';
+      const expiryDate = foundDates.length >= 1 ? foundDates[foundDates.length - 1] : '';
 
       return {
         regNumber,
         certificateNumber,
-        issueDate: dates.issueDate,
-        expiryDate: dates.expiryDate,
+        issueDate,
+        expiryDate,
         fuelType,
         vehicleType,
         rawText: trimmed,
@@ -244,7 +252,7 @@ export class ScannerService implements OnModuleDestroy {
   parseParivahanText(rawText: string): ExtractedPucData {
     const clean = rawText.replace(/\r/g, '');
     const datePattern =
-      '(\\d{4}[\\/\\-\\.]\\d{1,2}[\\/\\-\\.]\\d{1,2}|\\d{1,2}[\\s\\-\\.\\/]+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*[\\s\\-\\.\\/,]+\\d{2,4}|\\d{1,2}[\\/\\-\\.]\\d{1,2}[\\/\\-\\.]\\d{2,4})';
+      '(\\d{4}\\s*[\\/\\-\\.]\\s*\\d{1,2}\\s*[\\/\\-\\.]\\s*\\d{1,2}|\\d{1,2}[\\s\\-\\.\\/]+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*[\\s\\-\\.\\/,]+\\d{2,4}|\\d{1,2}\\s*[\\/\\-\\.]\\s*\\d{1,2}\\s*[\\/\\-\\.]\\s*\\d{2,4})';
 
     // 1. Vehicle Registration Number (handles OCR lookalikes like O->0 in RTO digits, never spans newlines)
     const regLabelMatch = clean.match(
@@ -263,23 +271,58 @@ export class ScannerService implements OnModuleDestroy {
       ) || clean.match(/\b([A-Z]{2}[0-9]{8,18})\b/i);
     const certificateNumber = certMatch ? certMatch[1].trim().toUpperCase() : '';
 
-    // 3. Expiry Date (Valid Upto)
+    // 3. Expiry Date (Valid Upto / Valid up to / Validity / Expiry)
     const validMatch = clean.match(
       new RegExp(
-        `(?:Valid\\s*Upto|Validity\\s*Upto|Valid\\s*Till|Expiry\\s*Date|Valid\\s*To|Valid\\s*Until)[\\s:.\\-©\\n]+${datePattern}`,
+        `(?:PUCC\\s*Valid\\s*up\\s*to|Certificate\\s*Valid\\s*up\\s*to|Valid\\s*up\\s*to|Validity\\s*up\\s*to|Valid\\s*Till|Valid\\s*Until|Valid\\s*To|Expiry\\s*Date|Date\\s*of\\s*Expiry|Validity|Expiry)[^\\d\\n]{0,25}${datePattern}`,
         'i',
       ),
     );
-    const expiryDate = validMatch ? this.normalizeDateString(validMatch[1]) : '';
+    let expiryDate = validMatch ? this.normalizeDateString(validMatch[1]) : '';
 
     // 4. Issue Date (Date of Testing or standalone Date line)
     const testMatch = clean.match(
       new RegExp(
-        `(?:Date\\s*(?:&\\s*Time\\s*)?of\\s*Testing|Date\\s*of\\s*Issue|Testing\\s*Date|Test\\s*Date|Issue\\s*Date|Tested\\s*On|(?:^|\\n)\\s*Date(?!\\s*of\\s*Registration))[\\s:.\\-©\\n]+${datePattern}`,
+        `(?:Date\\s*(?:&\\s*Time\\s*)?of\\s*Testing|Date\\s*of\\s*Issue|Testing\\s*Date|Test\\s*Date|Issue\\s*Date|Tested\\s*On|(?:^|\\n)\\s*Date(?!\\s*of\\s*Registration))[^\\d\\n]{0,25}${datePattern}`,
         'i',
       ),
     );
-    const issueDate = testMatch ? this.normalizeDateString(testMatch[1]) : '';
+    let issueDate = testMatch ? this.normalizeDateString(testMatch[1]) : '';
+
+    // 4B. Two-column PDF / OCR fallback: collect all candidate dates excluding Registration / Mfg dates
+    if (!expiryDate || !issueDate) {
+      const globalDateRegex = new RegExp(datePattern, 'gi');
+      const candidateDates: string[] = [];
+      for (const line of clean.split('\n')) {
+        if (
+          /Date\s*of\s*Registration|Registration\s*Date|Manufacturing|Mfg|Birth|DOB|Printed\s*On|Print\s*Date|Generated\s*On|Downloaded\s*On/i.test(
+            line,
+          )
+        ) {
+          continue;
+        }
+        let m: RegExpExecArray | null;
+        while ((m = globalDateRegex.exec(line)) !== null) {
+          const parsedDate = this.normalizeDateString(m[1]);
+          if (parsedDate) candidateDates.push(parsedDate);
+        }
+      }
+      const uniqueSorted = Array.from(new Set(candidateDates)).sort();
+      if (!expiryDate && uniqueSorted.length > 0) {
+        if (issueDate) {
+          const later = uniqueSorted.filter((d) => d > issueDate);
+          if (later.length > 0) expiryDate = later[later.length - 1];
+        } else if (uniqueSorted.length >= 2) {
+          issueDate = uniqueSorted[0];
+          expiryDate = uniqueSorted[uniqueSorted.length - 1];
+        } else {
+          expiryDate = uniqueSorted[0];
+        }
+      } else if (!issueDate && uniqueSorted.length > 0 && expiryDate) {
+        const earlier = uniqueSorted.filter((d) => d < expiryDate);
+        if (earlier.length > 0) issueDate = earlier[earlier.length - 1];
+      }
+    }
 
     // 5. Fuel Type
     const fuelMatch = clean.match(/(?:Fuel(?:\s*Type|\s*Used)?)[\s:.\-]+([^\n\r,]+)/i);
@@ -358,12 +401,22 @@ export class ScannerService implements OnModuleDestroy {
 
   private normalizeDateString(dStr: string): string {
     if (!dStr) return '';
-    const trimmed = dStr.trim();
+    const trimmed = dStr.replace(/\s*([\/\-\.])\s*/g, '$1').trim();
+
+    const formatValid = (y: string, m: string, d: string): string => {
+      let monthNum = Number(m);
+      let dayNum = Number(d);
+      if (monthNum > 12 && dayNum <= 12) {
+        [monthNum, dayNum] = [dayNum, monthNum];
+      }
+      if (monthNum < 1 || monthNum > 12 || dayNum < 1 || dayNum > 31) return '';
+      return `${y}-${String(monthNum).padStart(2, '0')}-${String(dayNum).padStart(2, '0')}`;
+    };
 
     // YYYY-MM-DD or YYYY/MM/DD
     const isoMatch = trimmed.match(/^(\d{4})[\/\-\.](\d{1,2})[\/\-\.](\d{1,2})$/);
     if (isoMatch) {
-      return `${isoMatch[1]}-${isoMatch[2].padStart(2, '0')}-${isoMatch[3].padStart(2, '0')}`;
+      return formatValid(isoMatch[1], isoMatch[2], isoMatch[3]);
     }
 
     // DD-MMM-YYYY or DD MMM YYYY (e.g. 08-Dec-2027)
@@ -391,20 +444,18 @@ export class ScannerService implements OnModuleDestroy {
       if (month) {
         let year = textMonthMatch[3];
         if (year.length === 2) year = '20' + year;
-        return `${year}-${month}-${textMonthMatch[1].padStart(2, '0')}`;
+        return formatValid(year, month, textMonthMatch[1]);
       }
     }
 
     // DD/MM/YYYY or DD-MM-YYYY
     const m = trimmed.match(/(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})/);
     if (!m) return '';
-    const day = m[1].padStart(2, '0');
-    const month = m[2].padStart(2, '0');
     let year = m[3];
     if (year.length === 2) {
       year = '20' + year;
     }
-    return `${year}-${month}-${day}`;
+    return formatValid(year, m[2], m[1]);
   }
 
   private normalizeFuelType(raw: string): string {
