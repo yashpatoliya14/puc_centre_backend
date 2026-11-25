@@ -64,8 +64,9 @@ export class AuthController {
 
   private async createSession(user: UserRow, req: AuthenticatedRequest): Promise<string> {
     const sessionId = crypto.randomUUID();
-    // 30 days (~1 month) session token validity
-    const SESSION_EXPIRATION_MS = 30 * 24 * 60 * 60 * 1000;
+    // 30 days (1 month) session token validity
+    const ttlDays = Math.max(1, Number(process.env.SESSION_TTL_DAYS) || 30);
+    const SESSION_EXPIRATION_MS = ttlDays * 24 * 60 * 60 * 1000;
     const expiresAt = Date.now() + SESSION_EXPIRATION_MS;
     const token = signSessionToken({
       sid: sessionId,
@@ -163,7 +164,7 @@ export class AuthController {
     const tenantId = crypto.randomUUID();
     const userId = crypto.randomUUID();
     const nowIso = new Date().toISOString();
-    const verificationToken = generateToken(20);
+    const verificationToken = generateToken(32);
     const normalizedPhone = normalizeIndianPhone(data.mobileNumber);
 
     await this.db.execute(
@@ -303,7 +304,7 @@ export class AuthController {
       // Do not reveal account existence in production responses
       return { ok: true, message: 'If an account matches that email, a password reset token has been issued.' };
     }
-    const resetToken = generateToken(18);
+    const resetToken = generateToken(32);
     const expiresAt = new Date(Date.now() + 30 * 60_000).toISOString();
     await this.db.execute(
       `UPDATE users SET reset_token = ?, reset_token_expires_at = ?, updated_at = ? WHERE id = ?`,

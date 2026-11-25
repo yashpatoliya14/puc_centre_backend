@@ -5,7 +5,7 @@ const EPHEMERAL_ENCRYPTION_KEY = crypto.randomBytes(32);
 
 function getSessionSecret(): Buffer {
   const envSecret = process.env.SESSION_SIGNING_SECRET?.trim();
-  if (envSecret && envSecret.length >= 16) {
+  if (envSecret && envSecret.length > 0) {
     return crypto.createHash('sha256').update(envSecret).digest();
   }
   return EPHEMERAL_SESSION_KEY;
@@ -16,7 +16,7 @@ function getEncryptionKey(): Buffer {
   if (envKey && /^[0-9a-fA-F]{64}$/.test(envKey)) {
     return Buffer.from(envKey, 'hex');
   }
-  if (envKey && envKey.length >= 16) {
+  if (envKey && envKey.length > 0) {
     return crypto.createHash('sha256').update(envKey).digest();
   }
   return EPHEMERAL_ENCRYPTION_KEY;
@@ -84,10 +84,15 @@ export interface SessionTokenPayload {
   uid: string;
   tid: string;
   exp: number;
+  jti?: string;
 }
 
 export function signSessionToken(payload: SessionTokenPayload): string {
-  const body = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  const enriched: SessionTokenPayload = {
+    ...payload,
+    jti: payload.jti || crypto.randomBytes(32).toString('hex'),
+  };
+  const body = Buffer.from(JSON.stringify(enriched), 'utf8').toString('base64url');
   const sig = crypto
     .createHmac('sha256', getSessionSecret())
     .update(body)
@@ -128,6 +133,6 @@ export function verifyHmacSignature(rawPayload: string, signature: string, secre
   return crypto.timingSafeEqual(a, b);
 }
 
-export function generateToken(bytes = 24): string {
+export function generateToken(bytes = 48): string {
   return crypto.randomBytes(bytes).toString('hex');
 }
