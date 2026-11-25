@@ -246,11 +246,13 @@ export class ScannerService implements OnModuleDestroy {
     const datePattern =
       '(\\d{4}[\\/\\-\\.]\\d{1,2}[\\/\\-\\.]\\d{1,2}|\\d{1,2}[\\s\\-\\.\\/]+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*[\\s\\-\\.\\/,]+\\d{2,4}|\\d{1,2}[\\/\\-\\.]\\d{1,2}[\\/\\-\\.]\\d{2,4})';
 
-    // 1. Vehicle Registration Number
+    // 1. Vehicle Registration Number (handles OCR lookalikes like O->0 in RTO digits, never spans newlines)
     const regLabelMatch = clean.match(
-      /(?:Vehicle\s*Registration\s*No\.?|Registration\s*No\.?|Registration\s*Number|Vehicle\s*Reg\s*No\.?|Vehicle\s*No\.?|Regn\.?\s*No\.?|Reg\.?\s*No\.?)[\s:.\-\n]+([A-Z]{2}[-\s]?[0-9]{1,2}[-\s]?[A-Z]{0,3}[-\s]?[0-9]{4})/i,
+      /(?:Vehicle\s*Registration\s*No\.?|Registration\s*No\.?|Registration\s*Number|Vehicle\s*Reg\s*No\.?|Vehicle\s*No\.?|Regn\.?\s*No\.?|Reg\.?\s*No\.?)[\s:.\-\n]+([A-Z]{2}[- ]?[0-9OQDIlZSB]{1,2}[- ]?[A-Z0-9]{0,3}[- ]?[0-9OQDIlZSB]{4})\b/i,
     );
-    const regBareMatch = clean.match(/\b([A-Z]{2}[-\s]?[0-9]{1,2}[-\s]?[A-Z]{1,3}[-\s]?[0-9]{4})\b/i);
+    const regBareMatch = clean.match(
+      /\b([A-Z]{2}[- ]?[0-9OQDIlZSB]{1,2}[- ]?[A-Z0-9]{1,3}[- ]?[0-9OQDIlZSB]{4})\b/i,
+    );
     const regRaw = regLabelMatch ? regLabelMatch[1] : regBareMatch ? regBareMatch[1] : '';
     const regNumber = this.normalizeRegNumber(regRaw);
 
@@ -264,16 +266,16 @@ export class ScannerService implements OnModuleDestroy {
     // 3. Expiry Date (Valid Upto)
     const validMatch = clean.match(
       new RegExp(
-        `(?:Valid\\s*Upto|Validity\\s*Upto|Valid\\s*Till|Expiry\\s*Date|Valid\\s*To|Valid\\s*Until)[\\s:.\\-\\n]+${datePattern}`,
+        `(?:Valid\\s*Upto|Validity\\s*Upto|Valid\\s*Till|Expiry\\s*Date|Valid\\s*To|Valid\\s*Until)[\\s:.\\-©\\n]+${datePattern}`,
         'i',
       ),
     );
     const expiryDate = validMatch ? this.normalizeDateString(validMatch[1]) : '';
 
-    // 4. Issue Date (Date of Testing)
+    // 4. Issue Date (Date of Testing or standalone Date line)
     const testMatch = clean.match(
       new RegExp(
-        `(?:Date\\s*(?:&\\s*Time\\s*)?of\\s*Testing|Date\\s*of\\s*Issue|Testing\\s*Date|Test\\s*Date|Issue\\s*Date|Tested\\s*On)[\\s:.\\-\\n]+${datePattern}`,
+        `(?:Date\\s*(?:&\\s*Time\\s*)?of\\s*Testing|Date\\s*of\\s*Issue|Testing\\s*Date|Test\\s*Date|Issue\\s*Date|Tested\\s*On|(?:^|\\n)\\s*Date(?!\\s*of\\s*Registration))[\\s:.\\-©\\n]+${datePattern}`,
         'i',
       ),
     );
@@ -332,7 +334,26 @@ export class ScannerService implements OnModuleDestroy {
 
   private normalizeRegNumber(raw: string): string {
     if (!raw) return '';
-    return raw.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+    const cleaned = raw.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+    if (cleaned.length < 6 || cleaned.length > 12) return cleaned;
+
+    const toDigit = (ch: string) =>
+      ({ O: '0', Q: '0', D: '0', I: '1', L: '1', Z: '2', S: '5', B: '8' }[ch] || ch);
+    const toLetter = (ch: string) => ({ '0': 'O', '1': 'I', '5': 'S', '8': 'B' }[ch] || ch);
+
+    // Standard Indian plate: 2 state letters + 1-2 district digits + 1-3 series letters + 4 trailing digits
+    const m = cleaned.match(/^([A-Z0-9]{2})([A-Z0-9]{1,2})([A-Z0-9]{0,3})([A-Z0-9]{4})$/);
+    if (m) {
+      const state = m[1].split('').map(toLetter).join('');
+      const rto = m[2].split('').map(toDigit).join('');
+      const series = m[3].split('').map(toLetter).join('');
+      const num = m[4].split('').map(toDigit).join('');
+      const candidate = `${state}${rto}${series}${num}`;
+      if (/^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{4}$/.test(candidate)) {
+        return candidate;
+      }
+    }
+    return cleaned;
   }
 
   private normalizeDateString(dStr: string): string {

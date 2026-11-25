@@ -145,7 +145,15 @@ export class ScannerController {
         phone = tenant?.mobile_number ? `+91${tenant.mobile_number.slice(-10)}` : '+919999999999';
       }
 
-      const vType = (['2W', '3W', '4W', 'Commercial', 'Other'].includes(c.vehicleType || '')
+      const vType = ([
+        '2W',
+        '3W',
+        '4W',
+        '2-Wheeler',
+        '4-Wheeler',
+        'Commercial',
+        'Other',
+      ].includes(c.vehicleType || '')
         ? c.vehicleType
         : '4-Wheeler') as string;
       const fuel = c.fuelType || 'Petrol';
