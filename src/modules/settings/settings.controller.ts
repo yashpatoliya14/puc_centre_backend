@@ -1,4 +1,5 @@
 import { BadRequestException, Body, Controller, Get, Inject, Post, Put, Req, UseGuards } from '@nestjs/common';
+import crypto from 'crypto';
 import { z } from 'zod';
 import { DatabaseService } from '../../db/database.service';
 import { encryptSecret } from '../../common/crypto.util';
