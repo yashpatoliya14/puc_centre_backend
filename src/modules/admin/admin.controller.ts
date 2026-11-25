@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  Body,
   Controller,
   Get,
   Inject,
@@ -10,11 +11,25 @@ import {
   Req,
   UseGuards,
 } from '@nestjs/common';
+import crypto from 'crypto';
+import { z } from 'zod';
 import { DatabaseService } from '../../db/database.service';
 import { deriveCertificateStatus, getIstDateString } from '../../common/ist-date.util';
-import { toBool } from '../../common/types';
+import {
+  hashPassword,
+  validateStrongEmailId,
+  validateStrongPassword,
+} from '../../common/crypto.util';
+import { normalizeIndianPhone, toBool } from '../../common/types';
 import { AdminRoleGuard, TenantAuthGuard, type AuthenticatedRequest } from '../auth/auth.guard';
 import { AuditService } from '../audit/audit.service';
+
+const createAdminSchema = z.object({
+  fullName: z.string().min(2, 'Admin full name is required').max(100),
+  email: z.string().email('Valid Admin ID (email) is required'),
+  mobileNumber: z.string().min(10, 'Valid 10-digit mobile number is required').max(18),
+  password: z.string().min(10, 'Password must be at least 10 characters').max(100),
+});
 
 interface OwnerSummaryRow {
   id: string;
@@ -275,6 +290,97 @@ export class AdminController {
         isBlocked: toBool(tenant.is_blocked),
       },
       items,
+    };
+  }
+
+  @Get('admins')
+  async listAdmins() {
+    const rows = await this.db.query<{
+      id: string;
+      email: string;
+      full_name: string;
+      mobile_number: string | null;
+      last_login_at: string | null;
+      created_at: string;
+    }>(
+      `SELECT id, email, full_name, mobile_number, last_login_at, created_at
+       FROM users
+       WHERE role = 'admin' AND deleted_at IS NULL
+       ORDER BY created_at DESC`,
+    );
+
+    return {
+      items: rows.map((r) => ({
+        id: r.id,
+        email: r.email,
+        fullName: r.full_name,
+        mobileNumber: r.mobile_number || '',
+        lastLoginAt: r.last_login_at,
+        createdAt: r.created_at,
+      })),
+    };
+  }
+
+  @Post('admins')
+  async createAdmin(@Body() body: unknown, @Req() req: AuthenticatedRequest) {
+    const parsed = createAdminSchema.safeParse(body);
+    if (!parsed.success) {
+      throw new BadRequestException(parsed.error.issues[0]?.message || 'Invalid admin details');
+    }
+    const d = parsed.data;
+    const email = d.email.trim().toLowerCase();
+
+    const idError = validateStrongEmailId(email);
+    if (idError) throw new BadRequestException(idError);
+    const pwdError = validateStrongPassword(d.password);
+    if (pwdError) throw new BadRequestException(pwdError);
+
+    const existing = await this.db.queryOne<{ id: string }>(
+      `SELECT id FROM users WHERE email = ?`,
+      [email],
+    );
+    if (existing) {
+      throw new BadRequestException('An account with this ID (email) already exists');
+    }
+
+    const userId = crypto.randomUUID();
+    const nowIso = new Date().toISOString();
+    const normalizedPhone = normalizeIndianPhone(d.mobileNumber);
+
+    await this.db.execute(
+      `INSERT INTO users (id, tenant_id, email, full_name, mobile_number, password_hash, role, email_verified, theme_preference, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'admin', ?, 'dark', ?, ?)`,
+      [
+        userId,
+        req.auth!.tenantId,
+        email,
+        d.fullName.trim(),
+        normalizedPhone,
+        hashPassword(d.password),
+        true,
+        nowIso,
+        nowIso,
+      ],
+    );
+
+    await this.auditService.log({
+      tenantId: req.auth!.tenantId,
+      userId: req.auth!.userId,
+      action: 'admin.created',
+      entityType: 'user',
+      entityId: userId,
+      metadata: { email, fullName: d.fullName.trim() },
+    });
+
+    return {
+      ok: true,
+      admin: {
+        id: userId,
+        email,
+        fullName: d.fullName.trim(),
+        mobileNumber: normalizedPhone,
+        createdAt: nowIso,
+      },
     };
   }
 }

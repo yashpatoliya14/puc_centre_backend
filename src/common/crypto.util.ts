@@ -136,3 +136,34 @@ export function verifyHmacSignature(rawPayload: string, signature: string, secre
 export function generateToken(bytes = 48): string {
   return crypto.randomBytes(bytes).toString('hex');
 }
+
+export function validateStrongEmailId(email: string): string | null {
+  const trimmed = email.trim().toLowerCase();
+  const [localPart, domain] = trimmed.split('@');
+  if (!localPart || !domain || localPart.length < 4) {
+    return 'Owner/Admin ID (email) must have at least 4 characters before @';
+  }
+  if (!/^[a-z0-9._+-]{4,}$/.test(localPart)) {
+    return 'Owner/Admin ID can only contain letters, numbers, dots, underscores, or hyphens';
+  }
+  return null;
+}
+
+export function validateStrongPassword(password: string): string | null {
+  if (password.length < 10) {
+    return 'Password must be at least 10 characters long';
+  }
+  if (!/[A-Z]/.test(password)) {
+    return 'Password must include at least one uppercase letter (A-Z)';
+  }
+  if (!/[a-z]/.test(password)) {
+    return 'Password must include at least one lowercase letter (a-z)';
+  }
+  if (!/[0-9]/.test(password)) {
+    return 'Password must include at least one number (0-9)';
+  }
+  if (!/[^A-Za-z0-9]/.test(password)) {
+    return 'Password must include at least one special character (e.g. @, #, $, !)';
+  }
+  return null;
+}

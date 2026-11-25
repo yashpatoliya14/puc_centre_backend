@@ -169,6 +169,24 @@ export class CustomersController {
       expiryDate: r.expiry_date || '',
       certificateStatus: derived.status,
       daysUntilExpiry: derived.daysUntilExpiry,
+      vehicle: r.vehicle_id
+        ? {
+            id: r.vehicle_id,
+            registrationNumber: r.registration_number || '',
+            vehicleType: r.vehicle_type || '4-Wheeler',
+            fuelType: r.fuel_type || 'Petrol',
+          }
+        : null,
+      certificate: r.certificate_id
+        ? {
+            id: r.certificate_id,
+            certificateNumber: r.certificate_number || null,
+            issueDate: r.issue_date || '',
+            expiryDate: r.expiry_date || '',
+            status: derived.status,
+            daysUntilExpiry: derived.daysUntilExpiry,
+          }
+        : null,
       insurance: insuranceObj,
     };
   }
@@ -182,12 +200,13 @@ export class CustomersController {
     @Query('status') status?: string,
     @Query('page') pageStr?: string,
     @Query('pageSize') pageSizeStr?: string,
+    @Query('limit') limitStr?: string,
   ) {
     const tenantId = req.auth!.tenantId;
     const todayIst = getIstDateString();
     const in7Days = addDaysToDateStr(todayIst, 7);
     const page = Math.max(1, Number(pageStr) || 1);
-    const pageSize = Math.min(100, Math.max(5, Number(pageSizeStr) || 15));
+    const pageSize = Math.min(500, Math.max(5, Number(pageSizeStr || limitStr) || 15));
 
     const conditions: string[] = ['c.tenant_id = ?', 'c.deleted_at IS NULL'];
     const params: unknown[] = [tenantId];
@@ -390,21 +409,17 @@ export class CustomersController {
     }
     const regNo = normalizeVehicleReg(regRaw);
 
-    // Tenant-scoped duplicate prevention (vehicle reg OR mobile number + vehicle reg)
+    // Tenant-scoped duplicate prevention: number plate must be unique within one PUC centre; mobile numbers may be shared
+    const compactReg = regNo.replace(/[^A-Z0-9]/g, '');
     const dupVehicle = await this.db.queryOne<{ id: string }>(
-      `SELECT id FROM vehicles WHERE tenant_id = ? AND registration_number = ? AND deleted_at IS NULL`,
-      [tenantId, regNo],
+      `SELECT id FROM vehicles
+       WHERE tenant_id = ?
+         AND REPLACE(REPLACE(UPPER(registration_number), ' ', ''), '-', '') = ?
+         AND deleted_at IS NULL`,
+      [tenantId, compactReg],
     );
     if (dupVehicle) {
       throw new BadRequestException(`Vehicle ${regNo} already exists in your PUC centre.`);
-    }
-
-    const dupMobile = await this.db.queryOne<{ id: string }>(
-      `SELECT id FROM customers WHERE tenant_id = ? AND mobile_number = ? AND deleted_at IS NULL`,
-      [tenantId, phone],
-    );
-    if (dupMobile) {
-      throw new BadRequestException(`A customer with mobile ${phone} already exists in your centre.`);
     }
 
     const nowIso = new Date().toISOString();
@@ -569,18 +584,25 @@ export class CustomersController {
     }
     const regNo = normalizeVehicleReg(regRaw);
 
-    const dupMobile = await this.db.queryOne<{ id: string }>(
-      `SELECT id FROM customers WHERE tenant_id = ? AND mobile_number = ? AND id != ? AND deleted_at IS NULL`,
-      [tenantId, phone, id],
-    );
-    if (dupMobile) throw new BadRequestException(`Another customer already uses mobile ${phone}`);
-
-    if (existing.vehicle_id) {
-      const dupVehicle = await this.db.queryOne<{ id: string }>(
-        `SELECT id FROM vehicles WHERE tenant_id = ? AND registration_number = ? AND id != ? AND deleted_at IS NULL`,
-        [tenantId, regNo, existing.vehicle_id],
-      );
-      if (dupVehicle) throw new BadRequestException(`Another customer already uses vehicle ${regNo}`);
+    const compactReg = regNo.replace(/[^A-Z0-9]/g, '');
+    const dupVehicle = existing.vehicle_id
+      ? await this.db.queryOne<{ id: string }>(
+          `SELECT id FROM vehicles
+           WHERE tenant_id = ?
+             AND REPLACE(REPLACE(UPPER(registration_number), ' ', ''), '-', '') = ?
+             AND id != ?
+             AND deleted_at IS NULL`,
+          [tenantId, compactReg, existing.vehicle_id],
+        )
+      : await this.db.queryOne<{ id: string }>(
+          `SELECT id FROM vehicles
+           WHERE tenant_id = ?
+             AND REPLACE(REPLACE(UPPER(registration_number), ' ', ''), '-', '') = ?
+             AND deleted_at IS NULL`,
+          [tenantId, compactReg],
+        );
+    if (dupVehicle) {
+      throw new BadRequestException(`Vehicle ${regNo} already exists in your PUC centre.`);
     }
 
     const nowIso = new Date().toISOString();
@@ -596,11 +618,19 @@ export class CustomersController {
       ],
     );
 
-    if (existing.vehicle_id) {
+    let vehicleId = existing.vehicle_id;
+    if (vehicleId) {
       await this.db.execute(
         `UPDATE vehicles SET registration_number = ?, vehicle_type = ?, fuel_type = ?, updated_at = ?
          WHERE id = ? AND tenant_id = ?`,
-        [regNo, data.vehicleType, data.fuelType, nowIso, existing.vehicle_id, tenantId],
+        [regNo, data.vehicleType, data.fuelType, nowIso, vehicleId, tenantId],
+      );
+    } else {
+      vehicleId = crypto.randomUUID();
+      await this.db.execute(
+        `INSERT INTO vehicles (id, tenant_id, customer_id, registration_number, vehicle_type, fuel_type, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [vehicleId, tenantId, id, regNo, data.vehicleType, data.fuelType, nowIso, nowIso],
       );
     }
 
@@ -616,6 +646,15 @@ export class CustomersController {
         await this.reminderEngine.rescheduleOnExpiryChange(tenantId, id, existing.certificate_id, data.expiryDate);
         rescheduled = true;
       }
+    } else {
+      const certId = crypto.randomUUID();
+      await this.db.execute(
+        `INSERT INTO puc_certificates (id, tenant_id, customer_id, vehicle_id, certificate_number, issue_date, expiry_date, cycle_status, is_current, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
+        [certId, tenantId, id, vehicleId, data.certificateNumber?.trim() || null, data.issueDate, data.expiryDate, true, nowIso, nowIso],
+      );
+      await this.reminderEngine.generateScheduleForCertificate(tenantId, id, certId, data.expiryDate);
+      rescheduled = true;
     }
 
     if (data.insurance !== undefined) {
@@ -646,7 +685,7 @@ export class CustomersController {
               tenantId,
             ],
           );
-        } else if (existing.vehicle_id) {
+        } else if (vehicleId) {
           await this.db.execute(
             `INSERT INTO vehicle_insurances (id, tenant_id, customer_id, vehicle_id, policy_number, insurance_company, policy_type, start_date, expiry_date, premium_amount, status, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
@@ -654,7 +693,7 @@ export class CustomersController {
               crypto.randomUUID(),
               tenantId,
               id,
-              existing.vehicle_id,
+              vehicleId,
               data.insurance.policyNumber.trim(),
               data.insurance.insuranceCompany.trim(),
               data.insurance.policyType || 'Comprehensive',

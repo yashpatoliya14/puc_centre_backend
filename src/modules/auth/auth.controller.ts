@@ -20,6 +20,8 @@ import {
   hashPassword,
   sha256Hex,
   signSessionToken,
+  validateStrongEmailId,
+  validateStrongPassword,
   verifyPassword,
 } from '../../common/crypto.util';
 import { normalizeIndianPhone, toBool, type TenantRow, type UserRow } from '../../common/types';
@@ -33,7 +35,7 @@ const registerSchema = z.object({
   ownerName: z.string().min(2, 'Owner name is required').max(100),
   mobileNumber: z.string().min(10, 'Valid 10-digit mobile number required').max(16),
   email: z.string().email('Valid email required'),
-  password: z.string().min(8, 'Password must be at least 8 characters').max(100),
+  password: z.string().min(10, 'Password must be at least 10 characters').max(100),
   address: z.string().max(300).optional(),
   preloadSampleData: z.boolean().optional().default(true),
 });
@@ -45,12 +47,12 @@ const loginSchema = z.object({
 
 const resetPasswordSchema = z.object({
   token: z.string().min(10),
-  newPassword: z.string().min(8, 'Password must be at least 8 characters').max(100),
+  newPassword: z.string().min(10, 'Password must be at least 10 characters').max(100),
 });
 
 const changePasswordSchema = z.object({
   currentPassword: z.string().min(1),
-  newPassword: z.string().min(8, 'New password must be at least 8 characters').max(100),
+  newPassword: z.string().min(10, 'New password must be at least 10 characters').max(100),
 });
 
 @Controller('api/auth')
@@ -155,6 +157,11 @@ export class AuthController {
     }
     const data = parsed.data;
     const email = data.email.trim().toLowerCase();
+
+    const idError = validateStrongEmailId(email);
+    if (idError) throw new BadRequestException(idError);
+    const pwdError = validateStrongPassword(data.password);
+    if (pwdError) throw new BadRequestException(pwdError);
 
     const existing = await this.db.queryOne<{ id: string }>(`SELECT id FROM users WHERE email = ?`, [email]);
     if (existing) {
@@ -324,6 +331,8 @@ export class AuthController {
     if (!parsed.success) {
       throw new BadRequestException(parsed.error.issues[0]?.message || 'Invalid reset request');
     }
+    const pwdError = validateStrongPassword(parsed.data.newPassword);
+    if (pwdError) throw new BadRequestException(pwdError);
     const user = await this.db.queryOne<UserRow>(
       `SELECT * FROM users WHERE reset_token = ? AND deleted_at IS NULL`,
       [parsed.data.token],
@@ -351,6 +360,8 @@ export class AuthController {
     if (!parsed.success) {
       throw new BadRequestException(parsed.error.issues[0]?.message || 'Invalid password payload');
     }
+    const pwdError = validateStrongPassword(parsed.data.newPassword);
+    if (pwdError) throw new BadRequestException(pwdError);
     const user = await this.db.queryOne<UserRow>(`SELECT * FROM users WHERE id = ? AND tenant_id = ?`, [
       req.auth!.userId,
       req.auth!.tenantId,

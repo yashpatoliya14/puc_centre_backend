@@ -127,6 +127,8 @@ export class ScannerController {
       status: 'registered' | 'renewed' | 'failed';
     }> = [];
 
+    const seenRegsInBatch = new Set<string>();
+
     for (let i = 0; i < certs.length; i++) {
       const c = certs[i];
       const rawReg = (c.regNumber || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
@@ -134,6 +136,22 @@ export class ScannerController {
         errors.push({ index: i, regNumber: c.regNumber || 'UNKNOWN', error: 'Invalid vehicle plate number' });
         continue;
       }
+      if (seenRegsInBatch.has(rawReg)) {
+        errors.push({
+          index: i,
+          regNumber: rawReg,
+          error: `Duplicate vehicle number plate ${rawReg} in upload batch (must be unique within one PUC centre).`,
+        });
+        results.push({
+          regNumber: rawReg,
+          customerName: (c.customName || c.fullName || `Customer (${rawReg})`).trim(),
+          vehicleType: c.vehicleType || '4-Wheeler',
+          expiryDate: c.expiryDate || '',
+          status: 'failed',
+        });
+        continue;
+      }
+      seenRegsInBatch.add(rawReg);
 
       const fullName = (c.customName || c.fullName || `Customer (${rawReg})`).trim();
       let phone = (c.customMobile || c.mobileNumber || '').replace(/\D/g, '');
@@ -168,49 +186,27 @@ export class ScannerController {
         );
 
         if (existingVehicle) {
-          await this.db.execute(
-            `UPDATE puc_certificates SET is_current = 0 WHERE vehicle_id = ? AND tenant_id = ?`,
-            [existingVehicle.id, tenantId],
-          );
-
-          const newCertId = crypto.randomUUID();
-          await this.db.execute(
-            `INSERT INTO puc_certificates (id, tenant_id, customer_id, vehicle_id, certificate_number, issue_date, expiry_date, cycle_status, is_current, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)`,
-            [newCertId, tenantId, existingVehicle.customer_id, existingVehicle.id, certNo, issueDate, expiryDate, nowIso, nowIso],
-          );
-
-          if (shouldSchedule) {
-            await this.reminderEngine.generateScheduleForCertificate(
-              tenantId,
-              existingVehicle.customer_id,
-              newCertId,
-              expiryDate,
-            );
-          }
-
-          updated++;
+          errors.push({
+            index: i,
+            regNumber: rawReg,
+            error: `Vehicle ${rawReg} already exists in your PUC centre.`,
+          });
           results.push({
             regNumber: rawReg,
             customerName: fullName,
             vehicleType: vType,
             expiryDate,
-            status: 'renewed',
+            status: 'failed',
           });
         } else {
-          let cust = await this.db.queryOne<{ id: string }>(
-            `SELECT id FROM customers WHERE tenant_id = ? AND mobile_number = ? AND deleted_at IS NULL`,
-            [tenantId, phone],
+          // Same mobile number may be shared across multiple registrations in a PUC centre;
+          // only the vehicle number plate is strictly unique per centre.
+          const customerId = crypto.randomUUID();
+          await this.db.execute(
+            `INSERT INTO customers (id, tenant_id, full_name, mobile_number, language, status, consent_given, dnd_registered, reminders_enabled, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)`,
+            [customerId, tenantId, fullName, phone, defaultLang, true, false, true, nowIso, nowIso],
           );
-
-          const customerId = cust ? cust.id : crypto.randomUUID();
-          if (!cust) {
-            await this.db.execute(
-              `INSERT INTO customers (id, tenant_id, full_name, mobile_number, language, status, consent_given, dnd_registered, reminders_enabled, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, 'active', 1, 0, 1, ?, ?)`,
-              [customerId, tenantId, fullName, phone, defaultLang, nowIso, nowIso],
-            );
-          }
 
           const vehicleId = crypto.randomUUID();
           await this.db.execute(
@@ -222,8 +218,8 @@ export class ScannerController {
           const certId = crypto.randomUUID();
           await this.db.execute(
             `INSERT INTO puc_certificates (id, tenant_id, customer_id, vehicle_id, certificate_number, issue_date, expiry_date, cycle_status, is_current, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)`,
-            [certId, tenantId, customerId, vehicleId, certNo, issueDate, expiryDate, nowIso, nowIso],
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
+            [certId, tenantId, customerId, vehicleId, certNo, issueDate, expiryDate, true, nowIso, nowIso],
           );
 
           if (shouldSchedule) {
@@ -343,13 +339,13 @@ export class ScannerController {
 
     if (existingVehicle) {
       await this.db.execute(
-        `UPDATE puc_certificates SET is_current = 0 WHERE vehicle_id = ? AND tenant_id = ?`,
-        [existingVehicle.id, tenant.id],
+        `UPDATE puc_certificates SET is_current = ? WHERE vehicle_id = ? AND tenant_id = ?`,
+        [false, existingVehicle.id, tenant.id],
       );
       await this.db.execute(
         `INSERT INTO puc_certificates (id, tenant_id, customer_id, vehicle_id, certificate_number, issue_date, expiry_date, cycle_status, is_current, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)`,
-        [certId, tenant.id, existingVehicle.customer_id, existingVehicle.id, extracted.certificateNumber || null, extracted.issueDate || today, extracted.expiryDate || today, nowIso, nowIso],
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
+        [certId, tenant.id, existingVehicle.customer_id, existingVehicle.id, extracted.certificateNumber || null, extracted.issueDate || today, extracted.expiryDate || today, true, nowIso, nowIso],
       );
     } else {
       let cust = await this.db.queryOne<{ id: string }>(
@@ -360,8 +356,8 @@ export class ScannerController {
       if (!cust) {
         await this.db.execute(
           `INSERT INTO customers (id, tenant_id, full_name, mobile_number, language, status, consent_given, dnd_registered, reminders_enabled, created_at, updated_at)
-           VALUES (?, ?, ?, ?, 'gu', 'active', 1, 0, 1, ?, ?)`,
-          [targetCustId, tenant.id, fullName, mobile, nowIso, nowIso],
+           VALUES (?, ?, ?, ?, 'gu', 'active', ?, ?, ?, ?, ?)`,
+          [targetCustId, tenant.id, fullName, mobile, true, false, true, nowIso, nowIso],
         );
       }
       await this.db.execute(
@@ -371,8 +367,8 @@ export class ScannerController {
       );
       await this.db.execute(
         `INSERT INTO puc_certificates (id, tenant_id, customer_id, vehicle_id, certificate_number, issue_date, expiry_date, cycle_status, is_current, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)`,
-        [certId, tenant.id, targetCustId, vehicleId, extracted.certificateNumber || null, extracted.issueDate || today, extracted.expiryDate || today, nowIso, nowIso],
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
+        [certId, tenant.id, targetCustId, vehicleId, extracted.certificateNumber || null, extracted.issueDate || today, extracted.expiryDate || today, true, nowIso, nowIso],
       );
     }
 
