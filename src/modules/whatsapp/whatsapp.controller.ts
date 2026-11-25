@@ -105,6 +105,42 @@ export class WhatsAppController {
   }
 
   /**
+   * 4B. Send Insurance reminder using template "vehicle_insurance"
+   */
+  @Post('send-insurance-reminder')
+  @UseGuards(TenantAuthGuard)
+  async sendInsuranceReminder(
+    @Body()
+    body: {
+      to?: string;
+      customerName?: string;
+      vehiclePlate?: string;
+      expiryDate?: string;
+      policyNumber?: string;
+      insurerName?: string;
+      centreName?: string;
+      ownerName?: string;
+      contactNumber?: string;
+    },
+  ) {
+    if (!body?.to || !body?.vehiclePlate) {
+      throw new BadRequestException('Recipient "to" and "vehiclePlate" are required');
+    }
+    const result = await this.whatsappService.sendInsuranceReminder({
+      to: body.to,
+      customerName: body.customerName || 'Customer',
+      vehiclePlate: body.vehiclePlate,
+      expiryDate: body.expiryDate || 'Soon',
+      policyNumber: body.policyNumber || 'N/A',
+      insurerName: body.insurerName || 'Insurance Company',
+      centreName: body.centreName || 'PUC Centre',
+      ownerName: body.ownerName || 'Centre Owner',
+      contactNumber: body.contactNumber || 'Contact Office',
+    });
+    return { ok: true, data: result };
+  }
+
+  /**
    * 5. List Meta WhatsApp templates
    */
   @Get('templates')
@@ -128,6 +164,7 @@ export class WhatsAppController {
       phoneNumber: process.env.WHATSAPP_PHONE_NUMBER || null,
       phoneNumberId: process.env.WHATSAPP_PHONE_NUMBER_ID || null,
       defaultTemplate: process.env.WHATSAPP_TEMPLATE_NAME || 'puc_certificate_utility',
+      insuranceTemplate: process.env.WHATSAPP_INSURANCE_TEMPLATE_NAME || 'vehicle_insurance',
       language: process.env.WHATSAPP_TEMPLATE_LANGUAGE || 'en',
     };
   }

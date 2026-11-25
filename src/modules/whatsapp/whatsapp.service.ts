@@ -28,6 +28,18 @@ export interface PucReminderInput {
   contactNumber: string;
 }
 
+export interface InsuranceReminderInput {
+  to: string;
+  customerName: string;
+  vehiclePlate: string;
+  expiryDate: string;
+  policyNumber: string;
+  insurerName: string;
+  centreName: string;
+  ownerName: string;
+  contactNumber: string;
+}
+
 export interface MetaMessageResponse {
   messaging_product?: string;
   contacts?: Array<{ input: string; wa_id: string }>;
@@ -85,6 +97,10 @@ export class WhatsAppService {
 
   private get defaultTemplateName(): string {
     return process.env.WHATSAPP_TEMPLATE_NAME?.trim() || 'puc_certificate_utility';
+  }
+
+  private get defaultInsuranceTemplateName(): string {
+    return process.env.WHATSAPP_INSURANCE_TEMPLATE_NAME?.trim() || 'vehicle_insurance';
   }
 
   private get defaultTemplateLanguage(): string {
@@ -147,6 +163,47 @@ export class WhatsAppService {
       input.centreName || 'PUC Testing Centre',
       input.ownerName || 'Centre Owner',
       input.centreAddress || 'Station Road',
+      input.contactNumber || 'Contact Office',
+    ];
+
+    this.logger.log(
+      `Sending WhatsApp template "${templateName}" to ${this.maskPhoneNumber(input.to)} for vehicle ${input.vehiclePlate}`,
+    );
+
+    const { messageId } = await this.sendTemplateMessage({
+      to: input.to,
+      templateName,
+      languageCode: this.defaultTemplateLanguage,
+      bodyParameters,
+    });
+
+    return { messageId, template: templateName };
+  }
+
+  /**
+   * Send Vehicle Insurance Renewal Reminder using approved Meta template "vehicle_insurance".
+   * Positional parameters:
+   * {{1}}: Customer Name
+   * {{2}}: Vehicle Plate
+   * {{3}}: Expiry Date
+   * {{4}}: Policy Number
+   * {{5}}: Insurer Name
+   * {{6}}: Centre Name
+   * {{7}}: Owner Name
+   * {{8}}: Contact Number
+   */
+  async sendInsuranceReminder(
+    input: InsuranceReminderInput,
+  ): Promise<{ messageId: string; template: string }> {
+    const templateName = this.defaultInsuranceTemplateName;
+    const bodyParameters = [
+      input.customerName || 'Customer',
+      input.vehiclePlate || 'Vehicle',
+      input.expiryDate || 'Soon',
+      input.policyNumber || 'N/A',
+      input.insurerName || 'Insurance Company',
+      input.centreName || 'PUC Testing Centre',
+      input.ownerName || 'Centre Owner',
       input.contactNumber || 'Contact Office',
     ];
 

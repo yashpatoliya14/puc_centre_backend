@@ -757,12 +757,15 @@ export class CustomersController {
       messageText: rendered,
       whatsappUrl,
       reminderType: type,
-      templateName: type === 'puc' ? 'puc_certificate_utility' : 'vehicle_insurance',
+      templateName:
+        type === 'puc'
+          ? process.env.WHATSAPP_TEMPLATE_NAME?.trim() || 'puc_certificate_utility'
+          : process.env.WHATSAPP_INSURANCE_TEMPLATE_NAME?.trim() || 'vehicle_insurance',
     };
   }
 
   /**
-   * Direct 1-Click Send via Meta WhatsApp Cloud API using "puc_certificate_utility"
+   * Direct 1-Click Send via Meta WhatsApp Cloud API using "puc_certificate_utility" or "vehicle_insurance"
    */
   @Post(':id/send-whatsapp')
   async sendDirectWhatsApp(
@@ -787,22 +790,51 @@ export class CustomersController {
       `SELECT expiry_date FROM puc_certificates WHERE customer_id = ? AND tenant_id = ? AND is_current = ? AND deleted_at IS NULL LIMIT 1`,
       [id, tenantId, true],
     );
+    const insurance = await this.db.queryOne<{
+      policy_number: string;
+      insurance_company: string;
+      expiry_date: string;
+    }>(
+      `SELECT policy_number, insurance_company, expiry_date FROM vehicle_insurances WHERE customer_id = ? AND tenant_id = ? AND deleted_at IS NULL LIMIT 1`,
+      [id, tenantId],
+    );
+
+    const formatDdMmYyyy = (dateStr?: string | null) => {
+      if (!dateStr) return 'Soon';
+      const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr.trim());
+      return match ? `${match[3]}/${match[2]}/${match[1]}` : dateStr;
+    };
 
     const regNo = vehicle?.registration_number || 'Vehicle';
-    const rawExpiry = cert?.expiry_date;
-    const match = rawExpiry ? /^(\d{4})-(\d{2})-(\d{2})$/.exec(rawExpiry.trim()) : null;
-    const expiry = match ? `${match[3]}/${match[2]}/${match[1]}` : (rawExpiry || 'Soon');
 
-    const sendRes = await this.whatsappService.sendPucCertificateReminder({
-      to: customer.mobile_number,
-      customerName: customer.full_name,
-      vehiclePlate: regNo,
-      expiryDate: expiry,
-      centreName: tenant?.business_name || 'PUC Testing Centre',
-      ownerName: tenant?.owner_name || 'Centre Owner',
-      centreAddress: tenant?.address || 'Station Road',
-      contactNumber: tenant?.mobile_number || 'Helpline',
-    });
+    let sendRes: { messageId: string; template: string };
+    if (type === 'insurance') {
+      if (!insurance) {
+        throw new BadRequestException('No vehicle insurance policy found for this customer');
+      }
+      sendRes = await this.whatsappService.sendInsuranceReminder({
+        to: customer.mobile_number,
+        customerName: customer.full_name,
+        vehiclePlate: regNo,
+        expiryDate: formatDdMmYyyy(insurance.expiry_date),
+        policyNumber: insurance.policy_number || 'N/A',
+        insurerName: insurance.insurance_company || 'Insurance Company',
+        centreName: tenant?.business_name || 'PUC Testing Centre',
+        ownerName: tenant?.owner_name || 'Centre Owner',
+        contactNumber: tenant?.mobile_number || 'Helpline',
+      });
+    } else {
+      sendRes = await this.whatsappService.sendPucCertificateReminder({
+        to: customer.mobile_number,
+        customerName: customer.full_name,
+        vehiclePlate: regNo,
+        expiryDate: formatDdMmYyyy(cert?.expiry_date),
+        centreName: tenant?.business_name || 'PUC Testing Centre',
+        ownerName: tenant?.owner_name || 'Centre Owner',
+        centreAddress: tenant?.address || 'Station Road',
+        contactNumber: tenant?.mobile_number || 'Helpline',
+      });
+    }
 
     await this.auditService.log({
       tenantId,
@@ -813,6 +845,7 @@ export class CustomersController {
       metadata: {
         messageId: sendRes.messageId,
         template: sendRes.template,
+        reminderType: type,
         phone: customer.mobile_number,
         vehicle: regNo,
       },
