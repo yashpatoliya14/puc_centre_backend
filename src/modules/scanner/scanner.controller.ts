@@ -32,34 +32,6 @@ export class ScannerController {
   ) {}
 
   /**
-   * 0. VAHAN / RTO VEHICLE LOOKUP (Single-Field Plate Fetch)
-   * Accessible for fast operator auto-fill; extracts tenant context when available.
-   */
-  @Get('lookup-vehicle')
-  async lookupVehicle(
-    @Query('regNumber') regNumber: string,
-    @Req() req: AuthenticatedRequest,
-  ) {
-    if (!regNumber || !regNumber.trim()) {
-      throw new BadRequestException('regNumber query parameter is required');
-    }
-    const data = await this.scannerService.lookupVehicle(regNumber.trim(), req.auth?.tenantId);
-    return { ok: true, data };
-  }
-
-  @Post('lookup-vehicle')
-  async lookupVehiclePost(
-    @Body() body: { regNumber?: string },
-    @Req() req: AuthenticatedRequest,
-  ) {
-    if (!body?.regNumber || !body.regNumber.trim()) {
-      throw new BadRequestException('regNumber is required');
-    }
-    const data = await this.scannerService.lookupVehicle(body.regNumber.trim(), req.auth?.tenantId);
-    return { ok: true, data };
-  }
-
-  /**
    * 1. PARSE OFFICIAL PARIVAHAN PUC PDF
    */
   @Post('extract-pdf')
@@ -73,6 +45,23 @@ export class ScannerController {
     }
 
     const data = await this.scannerService.parsePdfBuffer(file.buffer);
+    return { ok: true, data, filename: file.originalname };
+  }
+
+  /**
+   * 1B. PARSE CERTIFICATE IMAGE VIA OCR (JPG / PNG / WebP)
+   */
+  @Post('extract-image')
+  @UseGuards(TenantAuthGuard)
+  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: 10 * 1024 * 1024 } }))
+  async extractFromImage(
+    @UploadedFile() file: { originalname: string; buffer: Buffer } | undefined,
+  ): Promise<{ ok: boolean; data: ExtractedPucData; filename: string }> {
+    if (!file || !file.buffer) {
+      throw new BadRequestException('Please upload a valid PUC certificate image');
+    }
+
+    const data = await this.scannerService.parseImageBuffer(file.buffer);
     return { ok: true, data, filename: file.originalname };
   }
 

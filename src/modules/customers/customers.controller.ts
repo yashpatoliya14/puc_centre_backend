@@ -23,7 +23,14 @@ import crypto from 'crypto';
 import * as XLSX from 'xlsx';
 import { z } from 'zod';
 import { DatabaseService } from '../../db/database.service';
-import { normalizeIndianPhone, normalizeVehicleReg, toBool, type TenantRow } from '../../common/types';
+import {
+  DEFAULT_WHATSAPP_INSURANCE_TEMPLATE,
+  DEFAULT_WHATSAPP_PUC_TEMPLATE,
+  normalizeIndianPhone,
+  normalizeVehicleReg,
+  toBool,
+  type TenantRow,
+} from '../../common/types';
 import { addDaysToDateStr, deriveCertificateStatus, getIstDateString } from '../../common/ist-date.util';
 import { TenantAuthGuard, type AuthenticatedRequest } from '../auth/auth.guard';
 import { ReminderEngineService } from '../reminders/reminder-engine.service';
@@ -707,25 +714,23 @@ export class CustomersController {
       [id, tenantId],
     );
 
-    // Official Meta template text for "puc_certificate_utility"
-    const defaultPucTpl =
-      tenant?.puc_message_template ||
-      'Hello *{customer_name}*,\n\nYour vehicle\'s PUC certificate for *{vehicle_number}* is expiring on *{expiry_date}*.\n\nPlease renew your PUC certificate before the expiry date to avoid penalties.\n\n🏢 *PUC Centre:* {centre_name}\n👤 *Owner Name:* {owner_name}\n📍 *Address:* {centre_address}\n📞 *Contact Number:* {contact_number}\n\n*Thank you for choosing.*';
+    const formatTemplateDate = (dateStr?: string | null) => {
+      if (!dateStr) return 'Soon';
+      const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr.trim());
+      return match ? `${match[3]}/${match[2]}/${match[1]}` : dateStr;
+    };
 
-    const defaultInsTpl =
-      tenant?.insurance_message_template ||
-      '🛡️ *Vehicle Insurance Renewal Notice*\n\nHello *{customer_name}*,\n\nYour vehicle insurance policy (*{policy_number}* with *{insurance_company}*) for *{vehicle_number}* expires on *{expiry_date}*.\n\nRenew your policy promptly to maintain continuous coverage and zero-break benefits.\n📞 For renewal support: {contact_number}\n\nBest regards,\n*{centre_name}*';
-
-    const template = type === 'insurance' ? defaultInsTpl : defaultPucTpl;
+    const template = type === 'insurance' ? DEFAULT_WHATSAPP_INSURANCE_TEMPLATE : DEFAULT_WHATSAPP_PUC_TEMPLATE;
     const regNo = vehicle?.registration_number || 'Vehicle';
-    const expiry = type === 'insurance' ? (insurance?.expiry_date || 'Soon') : (cert?.expiry_date || 'Soon');
+    const rawExpiry = type === 'insurance' ? insurance?.expiry_date : cert?.expiry_date;
+    const expiry = formatTemplateDate(rawExpiry);
 
     const rendered = template
       .replace(/\{customer_name\}/g, customer.full_name)
       .replace(/\{vehicle_number\}/g, regNo)
       .replace(/\{expiry_date\}/g, expiry)
-      .replace(/\{puc_expiry_date\}/g, cert?.expiry_date || expiry)
-      .replace(/\{insurance_expiry_date\}/g, insurance?.expiry_date || expiry)
+      .replace(/\{puc_expiry_date\}/g, formatTemplateDate(cert?.expiry_date || rawExpiry))
+      .replace(/\{insurance_expiry_date\}/g, formatTemplateDate(insurance?.expiry_date || rawExpiry))
       .replace(/\{policy_number\}/g, insurance?.policy_number || 'N/A')
       .replace(/\{insurance_company\}/g, insurance?.insurance_company || 'Insurance Company')
       .replace(/\{centre_name\}/g, tenant?.business_name || 'PUC Testing Centre')
@@ -784,7 +789,9 @@ export class CustomersController {
     );
 
     const regNo = vehicle?.registration_number || 'Vehicle';
-    const expiry = cert?.expiry_date || 'Soon';
+    const rawExpiry = cert?.expiry_date;
+    const match = rawExpiry ? /^(\d{4})-(\d{2})-(\d{2})$/.exec(rawExpiry.trim()) : null;
+    const expiry = match ? `${match[3]}/${match[2]}/${match[1]}` : (rawExpiry || 'Soon');
 
     const sendRes = await this.whatsappService.sendPucCertificateReminder({
       to: customer.mobile_number,

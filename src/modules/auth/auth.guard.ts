@@ -1,8 +1,15 @@
-import { CanActivate, ExecutionContext, Inject, Injectable, UnauthorizedException } from '@nestjs/common';
+import {
+  CanActivate,
+  ExecutionContext,
+  ForbiddenException,
+  Inject,
+  Injectable,
+  UnauthorizedException,
+} from '@nestjs/common';
 import type { Request } from 'express';
 import { DatabaseService } from '../../db/database.service';
 import { sha256Hex, verifySessionToken } from '../../common/crypto.util';
-import type { AuthContext } from '../../common/types';
+import { toBool, type AuthContext } from '../../common/types';
 
 export interface AuthenticatedRequest extends Request {
   auth?: AuthContext;
@@ -36,9 +43,11 @@ export class TenantAuthGuard implements CanActivate {
       role: string;
       user_deleted_at: string | null;
       tenant_deleted_at: string | null;
+      tenant_is_blocked: number | boolean | null;
     }>(
       `SELECT s.id, s.tenant_id, s.user_id, s.expires_at, s.revoked_at,
-              u.email, u.role, u.deleted_at as user_deleted_at, t.deleted_at as tenant_deleted_at
+              u.email, u.role, u.deleted_at as user_deleted_at,
+              t.deleted_at as tenant_deleted_at, t.is_blocked as tenant_is_blocked
        FROM user_sessions s
        INNER JOIN users u ON u.id = s.user_id
        INNER JOIN tenants t ON t.id = s.tenant_id
@@ -56,6 +65,10 @@ export class TenantAuthGuard implements CanActivate {
       throw new UnauthorizedException('Session has been revoked or expired');
     }
 
+    if (toBool(session.tenant_is_blocked) && session.role !== 'admin') {
+      throw new UnauthorizedException('Your PUC centre account has been blocked by the administrator.');
+    }
+
     req.auth = {
       userId: session.user_id,
       tenantId: session.tenant_id,
@@ -63,6 +76,17 @@ export class TenantAuthGuard implements CanActivate {
       email: session.email,
       role: session.role,
     };
+    return true;
+  }
+}
+
+@Injectable()
+export class AdminRoleGuard implements CanActivate {
+  canActivate(context: ExecutionContext): boolean {
+    const req = context.switchToHttp().getRequest<AuthenticatedRequest>();
+    if (!req.auth || req.auth.role !== 'admin') {
+      throw new ForbiddenException('Admin access required');
+    }
     return true;
   }
 }

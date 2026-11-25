@@ -1,9 +1,18 @@
-import { Injectable, Logger, BadRequestException } from '@nestjs/common';
+import { Injectable, Logger, BadRequestException, OnModuleDestroy } from '@nestjs/common';
+import { createWorker, type Worker as TesseractWorker } from 'tesseract.js';
 import { DatabaseService } from '../../db/database.service';
 import { getIstDateString } from '../../common/ist-date.util';
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
-const pdfParse = require('pdf-parse');
+const { PDFParse } = require('pdf-parse') as {
+  PDFParse: new (opts: { data: Uint8Array | Buffer }) => {
+    getText: () => Promise<{ text?: string }>;
+    getScreenshot: (params?: { scale?: number; first?: number; imageBuffer?: boolean }) => Promise<{
+      pages?: Array<{ data?: Uint8Array }>;
+    }>;
+    destroy: () => Promise<void>;
+  };
+};
 
 export interface ExtractedPucData {
   regNumber: string;
@@ -21,31 +30,95 @@ export interface ExtractedPucData {
 }
 
 @Injectable()
-export class ScannerService {
+export class ScannerService implements OnModuleDestroy {
   private readonly logger = new Logger(ScannerService.name);
-  private sandboxToken: string | null = null;
-  private sandboxTokenExpiresAt = 0;
+  private ocrWorker: TesseractWorker | null = null;
+  private ocrQueue: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly db: DatabaseService) {}
 
+  async onModuleDestroy(): Promise<void> {
+    if (this.ocrWorker) {
+      await this.ocrWorker.terminate().catch(() => {});
+      this.ocrWorker = null;
+    }
+  }
+
+  private async getOcrWorker(): Promise<TesseractWorker> {
+    if (!this.ocrWorker) {
+      this.ocrWorker = await createWorker('eng');
+    }
+    return this.ocrWorker;
+  }
+
+  private recognizeImageBuffer(buffer: Buffer): Promise<string> {
+    const task = this.ocrQueue.then(async () => {
+      const worker = await this.getOcrWorker();
+      const result = await worker.recognize(buffer);
+      return result?.data?.text || '';
+    });
+    this.ocrQueue = task.catch(() => {});
+    return task;
+  }
+
   /**
-   * Parse Parivahan PUC Certificate PDF buffer
+   * Parse Parivahan PUC Certificate PDF buffer (supports both text PDFs and scanned PDFs via OCR)
    */
   async parsePdfBuffer(buffer: Buffer): Promise<ExtractedPucData> {
     if (!buffer || buffer.length === 0) {
       throw new BadRequestException('Empty PDF file uploaded');
     }
 
+    const parser = new PDFParse({ data: new Uint8Array(buffer) });
     try {
-      const parsed = await pdfParse(buffer);
-      const rawText = parsed.text || '';
+      const parsed = await parser.getText();
+      let rawText = parsed?.text || '';
+
+      // Fallback for scanned / image-only PDFs where embedded text is absent
+      if (rawText.replace(/\s+/g, '').length < 25) {
+        try {
+          const shot = await parser.getScreenshot({ scale: 2, first: 1, imageBuffer: true });
+          const pageImg = shot?.pages?.[0]?.data;
+          if (pageImg && pageImg.length > 0) {
+            const ocrText = await this.recognizeImageBuffer(Buffer.from(pageImg));
+            if (ocrText.trim().length > rawText.trim().length) {
+              rawText = ocrText;
+            }
+          }
+        } catch (ocrErr) {
+          this.logger.warn(`Scanned PDF OCR fallback failed: ${ocrErr instanceof Error ? ocrErr.message : String(ocrErr)}`);
+        }
+      }
+
       const extracted = this.parseParivahanText(rawText);
-      extracted.rawText = rawText.slice(0, 500); // provide excerpt for verification
+      extracted.rawText = rawText.slice(0, 500);
       return extracted;
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       this.logger.error(`Failed to parse PDF: ${msg}`);
       throw new BadRequestException(`Could not parse PDF document: ${msg}`);
+    } finally {
+      await parser.destroy().catch(() => {});
+    }
+  }
+
+  /**
+   * Extract PUC certificate details from an uploaded image buffer using OCR
+   */
+  async parseImageBuffer(buffer: Buffer): Promise<ExtractedPucData> {
+    if (!buffer || buffer.length === 0) {
+      throw new BadRequestException('Empty image file uploaded');
+    }
+
+    try {
+      const rawText = await this.recognizeImageBuffer(buffer);
+      const extracted = this.parseParivahanText(rawText);
+      extracted.rawText = rawText.slice(0, 500);
+      return extracted;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger.error(`Failed to OCR image: ${msg}`);
+      throw new BadRequestException(`Could not read text from image: ${msg}`);
     }
   }
 
@@ -170,14 +243,16 @@ export class ScannerService {
   }
 
   /**
-   * Parse plain text from Parivahan PUC certificate document
+   * Parse plain text from Parivahan PUC certificate document or OCR output
    */
   parseParivahanText(rawText: string): ExtractedPucData {
     const clean = rawText.replace(/\r/g, '');
+    const datePattern =
+      '(\\d{4}[\\/\\-\\.]\\d{1,2}[\\/\\-\\.]\\d{1,2}|\\d{1,2}[\\s\\-\\.\\/]+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*[\\s\\-\\.\\/,]+\\d{2,4}|\\d{1,2}[\\/\\-\\.]\\d{1,2}[\\/\\-\\.]\\d{2,4})';
 
     // 1. Vehicle Registration Number
     const regLabelMatch = clean.match(
-      /(?:Registration\s*No|Vehicle\s*Reg\s*No|Vehicle\s*No|Regn\s*No|Reg\s*No)[\s:.\-]+([A-Z]{2}[-\s]?[0-9]{1,2}[-\s]?[A-Z]{0,3}[-\s]?[0-9]{4})/i,
+      /(?:Vehicle\s*Registration\s*No\.?|Registration\s*No\.?|Registration\s*Number|Vehicle\s*Reg\s*No\.?|Vehicle\s*No\.?|Regn\.?\s*No\.?|Reg\.?\s*No\.?)[\s:.\-\n]+([A-Z]{2}[-\s]?[0-9]{1,2}[-\s]?[A-Z]{0,3}[-\s]?[0-9]{4})/i,
     );
     const regBareMatch = clean.match(/\b([A-Z]{2}[-\s]?[0-9]{1,2}[-\s]?[A-Z]{1,3}[-\s]?[0-9]{4})\b/i);
     const regRaw = regLabelMatch ? regLabelMatch[1] : regBareMatch ? regBareMatch[1] : '';
@@ -185,29 +260,38 @@ export class ScannerService {
 
     // 2. Certificate Number
     const certMatch =
-      clean.match(/(?:Certificate\s*No|PUC\s*Certificate\s*No|PUCC\s*No)[\s:.\-]+([A-Z0-9]{8,22})/i) ||
-      clean.match(/\b([A-Z]{2}[0-9]{8,18})\b/i);
+      clean.match(
+        /(?:Certificate\s*(?:SL\.?|Serial)?\s*No\.?|PUC\s*Certificate\s*No\.?|PUCC\s*No\.?|Serial\s*No\.?)[\s:.\-]+([A-Z0-9\/\-]{6,26})/i,
+      ) || clean.match(/\b([A-Z]{2}[0-9]{8,18})\b/i);
     const certificateNumber = certMatch ? certMatch[1].trim().toUpperCase() : '';
 
     // 3. Expiry Date (Valid Upto)
     const validMatch = clean.match(
-      /(?:Valid\s*Upto|Validity\s*Upto|Valid\s*Till|Expiry\s*Date|Valid\s*To)[\s:.\-]+(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/i,
+      new RegExp(
+        `(?:Valid\\s*Upto|Validity\\s*Upto|Valid\\s*Till|Expiry\\s*Date|Valid\\s*To|Valid\\s*Until)[\\s:.\\-\\n]+${datePattern}`,
+        'i',
+      ),
     );
-    let expiryDate = validMatch ? this.normalizeDateString(validMatch[1]) : '';
+    const expiryDate = validMatch ? this.normalizeDateString(validMatch[1]) : '';
 
     // 4. Issue Date (Date of Testing)
     const testMatch = clean.match(
-      /(?:Date\s*of\s*Testing|Date\s*of\s*Issue|Test\s*Date|Issue\s*Date|Tested\s*On)[\s:.\-]+(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/i,
+      new RegExp(
+        `(?:Date\\s*(?:&\\s*Time\\s*)?of\\s*Testing|Date\\s*of\\s*Issue|Testing\\s*Date|Test\\s*Date|Issue\\s*Date|Tested\\s*On)[\\s:.\\-\\n]+${datePattern}`,
+        'i',
+      ),
     );
-    let issueDate = testMatch ? this.normalizeDateString(testMatch[1]) : '';
+    const issueDate = testMatch ? this.normalizeDateString(testMatch[1]) : '';
 
     // 5. Fuel Type
-    const fuelMatch = clean.match(/(?:Fuel(?:\s*Type)?)[\s:.\-]+([^\n\r,]+)/i);
+    const fuelMatch = clean.match(/(?:Fuel(?:\s*Type|\s*Used)?)[\s:.\-]+([^\n\r,]+)/i);
     const fuelRaw = fuelMatch ? fuelMatch[1] : clean;
     const fuelType = this.normalizeFuelType(fuelRaw);
 
     // 6. Vehicle Class / Type
-    const classMatch = clean.match(/(?:Vehicle\s*Class|Class\s*of\s*Vehicle|Vehicle\s*Type)[\s:.\-]+([^\n\r,]+)/i);
+    const classMatch = clean.match(
+      /(?:Vehicle\s*Category|Vehicle\s*Class|Class\s*of\s*Vehicle|Vehicle\s*Type)[\s:.\-]+([^\n\r,]+)/i,
+    );
     const vehicleType = this.normalizeVehicleType(classMatch ? classMatch[1] : clean);
 
     // 7. Make / Model
@@ -223,11 +307,15 @@ export class ScannerService {
     }
 
     // 8. Owner Name
-    const nameMatch = clean.match(/(?:Owner\s*Name|Customer\s*Name|Name\s*of\s*Owner)[\s:.\-]+([^\n\r,]+)/i);
+    const nameMatch = clean.match(
+      /(?:Owner\s*Name|Registered\s*Owner|Customer\s*Name|Name\s*of\s*Owner)[\s:.\-]+([^\n\r,]+)/i,
+    );
     const fullName = nameMatch ? nameMatch[1].trim().replace(/\s+/g, ' ') : '';
 
     // 9. Mobile Number
-    const mobileMatch = clean.match(/(?:Mobile(?:\s*No)?|Phone(?:\s*No)?)[\s:.\-]+([6-9]\d{9})\b/i);
+    const mobileMatch = clean.match(
+      /(?:Mobile(?:\s*No\.?|\s*Number)?|Phone(?:\s*No\.?)?|Contact(?:\s*No\.?)?)[\s:.\-]+(?:\+?91[\s\-]?|0)?([6-9]\d{9})\b/i,
+    );
     const mobileNumber = mobileMatch ? mobileMatch[1].trim() : '';
 
     // Default dates if one is missing
@@ -256,7 +344,45 @@ export class ScannerService {
 
   private normalizeDateString(dStr: string): string {
     if (!dStr) return '';
-    const m = dStr.match(/(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})/);
+    const trimmed = dStr.trim();
+
+    // YYYY-MM-DD or YYYY/MM/DD
+    const isoMatch = trimmed.match(/^(\d{4})[\/\-\.](\d{1,2})[\/\-\.](\d{1,2})$/);
+    if (isoMatch) {
+      return `${isoMatch[1]}-${isoMatch[2].padStart(2, '0')}-${isoMatch[3].padStart(2, '0')}`;
+    }
+
+    // DD-MMM-YYYY or DD MMM YYYY (e.g. 08-Dec-2027)
+    const monthMap: Record<string, string> = {
+      jan: '01',
+      feb: '02',
+      mar: '03',
+      apr: '04',
+      may: '05',
+      jun: '06',
+      jul: '07',
+      aug: '08',
+      sep: '09',
+      sept: '09',
+      oct: '10',
+      nov: '11',
+      dec: '12',
+    };
+    const textMonthMatch = trimmed.match(
+      /^(\d{1,2})[\s\-\.\/]+([A-Za-z]{3,9})[\s\-\.\/,]+(\d{2,4})$/,
+    );
+    if (textMonthMatch) {
+      const mKey = textMonthMatch[2].toLowerCase().slice(0, 4);
+      const month = monthMap[mKey] || monthMap[textMonthMatch[2].toLowerCase().slice(0, 3)];
+      if (month) {
+        let year = textMonthMatch[3];
+        if (year.length === 2) year = '20' + year;
+        return `${year}-${month}-${textMonthMatch[1].padStart(2, '0')}`;
+      }
+    }
+
+    // DD/MM/YYYY or DD-MM-YYYY
+    const m = trimmed.match(/(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})/);
     if (!m) return '';
     const day = m[1].padStart(2, '0');
     const month = m[2].padStart(2, '0');
@@ -270,14 +396,20 @@ export class ScannerService {
   private normalizeFuelType(raw: string): string {
     if (/CNG/i.test(raw)) return 'CNG';
     if (/DIESEL/i.test(raw)) return 'Diesel';
-    if (/ELECTRIC|EV/i.test(raw)) return 'Electric';
+    if (/ELECTRIC|\bEV\b/i.test(raw)) return 'Electric';
     return 'Petrol';
   }
 
   private normalizeVehicleType(raw: string): string {
-    if (/2\s*Wheeler|Motor\s*Cycle|Scooter|Moped|Two\s*Wheeler/i.test(raw)) return '2-Wheeler';
-    if (/Goods|Commercial|Heavy|Transport|HGV|Truck|Bus|Tractor/i.test(raw)) return 'Commercial';
-    if (/3\s*Wheeler|Auto|Rickshaw/i.test(raw)) return 'Other';
+    if (/2\s*[-\s]?Wheeler|\b2W\b|Motor\s*Cycle|MCWG|MCWOG|Scooter|Moped|Two\s*Wheeler/i.test(raw)) {
+      return '2-Wheeler';
+    }
+    if (/Goods|Commercial|Heavy|Transport|HGV|LCV|HCV|LGV|MGV|Truck|Bus|Tractor/i.test(raw)) {
+      return 'Commercial';
+    }
+    if (/3\s*[-\s]?Wheeler|\b3W\b|Auto|Rickshaw/i.test(raw)) {
+      return 'Other';
+    }
     return '4-Wheeler';
   }
 

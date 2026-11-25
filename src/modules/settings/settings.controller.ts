@@ -24,11 +24,11 @@ const simplifiedSettingsSchema = z.object({
   maxMessagesPerCustomer: z.number().int().min(1).max(20).default(3),
   callingWindowStart: z.string().regex(/^\d{2}:\d{2}$/).default('09:30'),
   callingWindowEnd: z.string().regex(/^\d{2}:\d{2}$/).default('19:30'),
-  remindDaysBefore: z.array(z.number().int()).default([7, 3, 0]),
-  remindDaysAfter: z.array(z.number().int()).default([1, 3]),
-  pucMessageTemplate: z.string().min(5).max(2000),
-  insuranceMessageTemplate: z.string().min(5).max(2000),
-  voiceScriptTemplate: z.string().min(5).max(2000),
+  remindDaysBefore: z.array(z.number().int().min(0).max(365)).default([7, 3, 0]),
+  remindDaysAfter: z.array(z.number().int().min(1).max(365)).default([1, 3]),
+  pucMessageTemplate: z.string().min(5).max(2000).optional(),
+  insuranceMessageTemplate: z.string().min(5).max(2000).optional(),
+  voiceScriptTemplate: z.string().min(5).max(2000).optional(),
   businessName: z.string().min(2).max(120).optional(),
   ownerName: z.string().min(2).max(100).optional(),
   mobileNumber: z.string().min(10).max(18).optional(),
@@ -142,8 +142,8 @@ export class SettingsController {
         callingWindowEnd: tenant.calling_window_end || '19:30',
         remindDaysBefore: JSON.parse(tenant.remind_days_before || '[7,3,0]') as number[],
         remindDaysAfter: JSON.parse(tenant.remind_days_after || '[1,3]') as number[],
-        pucMessageTemplate: tenant.puc_message_template || DEFAULT_WHATSAPP_PUC_TEMPLATE,
-        insuranceMessageTemplate: tenant.insurance_message_template || DEFAULT_WHATSAPP_INSURANCE_TEMPLATE,
+        pucMessageTemplate: DEFAULT_WHATSAPP_PUC_TEMPLATE,
+        insuranceMessageTemplate: DEFAULT_WHATSAPP_INSURANCE_TEMPLATE,
         voiceScriptTemplate: tenant.voice_script_template || DEFAULT_GUJARATI_TEMPLATE,
         businessName: tenant.business_name,
         ownerName: tenant.owner_name,
@@ -228,13 +228,18 @@ export class SettingsController {
     const tenantId = req.auth!.tenantId;
     const nowIso = new Date().toISOString();
 
+    const daysBefore = Array.from(new Set(d.remindDaysBefore)).sort((a, b) => b - a);
+    const daysAfter = Array.from(new Set(d.remindDaysAfter)).sort((a, b) => a - b);
+
     await this.db.execute(
       `UPDATE tenants
        SET calls_enabled = ?, auto_call_on_registration = ?, messages_enabled = ?, automation_enabled = ?,
            max_calls_per_customer = ?, retry_interval_minutes = ?, max_messages_per_customer = ?,
            calling_window_start = ?, calling_window_end = ?,
            remind_days_before = ?, remind_days_after = ?,
-           puc_message_template = ?, insurance_message_template = ?, voice_script_template = ?,
+           puc_message_template = COALESCE(?, puc_message_template),
+           insurance_message_template = COALESCE(?, insurance_message_template),
+           voice_script_template = COALESCE(?, voice_script_template),
            business_name = COALESCE(?, business_name),
            owner_name = COALESCE(?, owner_name),
            mobile_number = COALESCE(?, mobile_number),
@@ -250,11 +255,11 @@ export class SettingsController {
         d.maxMessagesPerCustomer,
         d.callingWindowStart,
         d.callingWindowEnd,
-        JSON.stringify(d.remindDaysBefore),
-        JSON.stringify(d.remindDaysAfter),
-        d.pucMessageTemplate,
-        d.insuranceMessageTemplate,
-        d.voiceScriptTemplate,
+        JSON.stringify(daysBefore),
+        JSON.stringify(daysAfter),
+        d.pucMessageTemplate ?? null,
+        d.insuranceMessageTemplate ?? null,
+        d.voiceScriptTemplate ?? null,
         d.businessName?.trim() || null,
         d.ownerName?.trim() || null,
         d.mobileNumber ? normalizeIndianPhone(d.mobileNumber) : null,
@@ -262,6 +267,43 @@ export class SettingsController {
         tenantId,
       ],
     );
+
+    // Sync reminder_rules with configured days before / on expiry / after expiry
+    const desiredOffsets = [
+      ...daysBefore.map((day) => ({
+        offset: -day,
+        label: day === 0 ? 'On expiry date' : `${day} ${day === 1 ? 'day' : 'days'} before expiry`,
+      })),
+      ...daysAfter.map((day) => ({
+        offset: day,
+        label: `${day} ${day === 1 ? 'day' : 'days'} after expiry`,
+      })),
+    ];
+
+    await this.db.execute(
+      `UPDATE reminder_rules SET is_active = ?, updated_at = ? WHERE tenant_id = ?`,
+      [false, nowIso, tenantId],
+    );
+
+    for (let i = 0; i < desiredOffsets.length; i++) {
+      const rule = desiredOffsets[i];
+      const existingRule = await this.db.queryOne<{ id: string }>(
+        `SELECT id FROM reminder_rules WHERE tenant_id = ? AND offset_days = ?`,
+        [tenantId, rule.offset],
+      );
+      if (existingRule) {
+        await this.db.execute(
+          `UPDATE reminder_rules SET label = ?, is_active = ?, sort_order = ?, updated_at = ? WHERE id = ?`,
+          [rule.label, true, i + 1, nowIso, existingRule.id],
+        );
+      } else {
+        await this.db.execute(
+          `INSERT INTO reminder_rules (id, tenant_id, label, offset_days, is_active, sort_order, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [crypto.randomUUID(), tenantId, rule.label, rule.offset, true, i + 1, nowIso, nowIso],
+        );
+      }
+    }
 
     const existingTel = await this.db.queryOne<{
       id: string;

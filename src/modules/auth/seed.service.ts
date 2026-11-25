@@ -11,6 +11,8 @@ import {
 
 export const DEMO_EMAIL = 'owner@pucflow.in';
 export const DEMO_PASSWORD = 'PucFlow@2026';
+export const ADMIN_EMAIL = process.env.ADMIN_EMAIL?.trim().toLowerCase() || 'admin@pucflow.in';
+export const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD?.trim() || 'Admin@2026';
 
 @Injectable()
 export class SeedService {
@@ -271,6 +273,7 @@ export class SeedService {
   }
 
   async ensureDemoTenantExists(): Promise<void> {
+    await this.ensureAdminExists();
     const existing = await this.db.queryOne<{ id: string }>(`SELECT id FROM users WHERE email = ?`, [DEMO_EMAIL]);
     if (existing) return;
 
@@ -293,5 +296,39 @@ export class SeedService {
     const resources = await this.createDefaultTenantResources(tenantId, 'Shree Ganesh PUC');
     await this.seedSampleCentreData(tenantId, userId, resources);
     console.log(`[SeedService] Pre-loaded sample PUC centre (${DEMO_EMAIL}).`);
+  }
+
+  async ensureAdminExists(): Promise<void> {
+    const existing = await this.db.queryOne<{ id: string; role: string }>(
+      `SELECT id, role FROM users WHERE email = ? AND deleted_at IS NULL`,
+      [ADMIN_EMAIL],
+    );
+    if (existing) {
+      if (existing.role !== 'admin') {
+        await this.db.execute(`UPDATE users SET role = 'admin', updated_at = ? WHERE id = ?`, [
+          new Date().toISOString(),
+          existing.id,
+        ]);
+      }
+      return;
+    }
+
+    const tenantId = crypto.randomUUID();
+    const userId = crypto.randomUUID();
+    const nowIso = new Date().toISOString();
+
+    await this.db.execute(
+      `INSERT INTO tenants (id, business_name, owner_name, mobile_number, email, address, timezone, automation_enabled, auto_schedule_on_import, default_language, default_call_time, calling_window_start, calling_window_end, calling_days_json, max_attempts, retry_interval_minutes, max_calls_per_customer, expiry_warning_days, created_at, updated_at)
+       VALUES (?, 'PUC Flow Platform Admin', 'System Administrator', '+919999999999', ?, 'HQ', 'Asia/Kolkata', ?, ?, 'en', '10:00', '09:30', '19:30', '[1,2,3,4,5,6]', 3, 60, 6, 7, ?, ?)`,
+      [tenantId, ADMIN_EMAIL, false, false, nowIso, nowIso],
+    );
+
+    await this.db.execute(
+      `INSERT INTO users (id, tenant_id, email, full_name, mobile_number, password_hash, role, email_verified, theme_preference, created_at, updated_at)
+       VALUES (?, ?, ?, 'Platform Admin', '+919999999999', ?, 'admin', ?, 'dark', ?, ?)`,
+      [userId, tenantId, ADMIN_EMAIL, hashPassword(ADMIN_PASSWORD), true, nowIso, nowIso],
+    );
+
+    console.log(`[SeedService] Admin account ready (${ADMIN_EMAIL}).`);
   }
 }

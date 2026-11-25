@@ -3,6 +3,7 @@ import {
   Body,
   Controller,
   Delete,
+  ForbiddenException,
   Get,
   Inject,
   Param,
@@ -215,6 +216,17 @@ export class AuthController {
     );
     if (!user || !verifyPassword(parsed.data.password, user.password_hash)) {
       throw new UnauthorizedException('Invalid email or password');
+    }
+
+    const tenant = await this.db.queryOne<{ is_blocked?: number | boolean; deleted_at: string | null }>(
+      `SELECT is_blocked, deleted_at FROM tenants WHERE id = ?`,
+      [user.tenant_id],
+    );
+    if (!tenant || tenant.deleted_at) {
+      throw new UnauthorizedException('Account is inactive');
+    }
+    if (toBool(tenant.is_blocked) && user.role !== 'admin') {
+      throw new ForbiddenException('Your PUC centre account has been blocked by the administrator.');
     }
 
     const token = await this.createSession(user, req);

@@ -5,8 +5,9 @@ import { AuditService } from './modules/audit/audit.service';
 import { CallingService } from './modules/telephony/calling.service';
 import { ReminderEngineService } from './modules/reminders/reminder-engine.service';
 import { SeedService } from './modules/auth/seed.service';
-import { TenantAuthGuard } from './modules/auth/auth.guard';
+import { TenantAuthGuard, AdminRoleGuard } from './modules/auth/auth.guard';
 import { AuthController } from './modules/auth/auth.controller';
+import { AdminController } from './modules/admin/admin.controller';
 import { CustomersController } from './modules/customers/customers.controller';
 import { DashboardController } from './modules/dashboard/dashboard.controller';
 import { AutomationController } from './modules/automation/automation.controller';
@@ -20,6 +21,7 @@ import { WhatsAppService } from './modules/whatsapp/whatsapp.service';
   controllers: [
     AppController,
     AuthController,
+    AdminController,
     CustomersController,
     DashboardController,
     AutomationController,
@@ -34,6 +36,7 @@ import { WhatsAppService } from './modules/whatsapp/whatsapp.service';
     ReminderEngineService,
     SeedService,
     TenantAuthGuard,
+    AdminRoleGuard,
     ScannerService,
     WhatsAppService,
   ],

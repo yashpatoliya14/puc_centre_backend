@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS tenants (
   insurance_message_template TEXT,
   voice_script_template TEXT,
   expiry_warning_days INTEGER NOT NULL DEFAULT 7,
+  is_blocked INTEGER NOT NULL DEFAULT 0,
+  blocked_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   deleted_at TEXT
@@ -400,6 +402,8 @@ export class DatabaseService implements OnModuleDestroy {
           ALTER TABLE tenants ADD COLUMN IF NOT EXISTS puc_message_template TEXT;
           ALTER TABLE tenants ADD COLUMN IF NOT EXISTS insurance_message_template TEXT;
           ALTER TABLE tenants ADD COLUMN IF NOT EXISTS voice_script_template TEXT;
+          ALTER TABLE tenants ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN NOT NULL DEFAULT FALSE;
+          ALTER TABLE tenants ADD COLUMN IF NOT EXISTS blocked_at TIMESTAMPTZ;
         `);
         this.engine = 'supabase-postgresql';
         this.initialized = true;
@@ -439,7 +443,9 @@ export class DatabaseService implements OnModuleDestroy {
       "ALTER TABLE tenants ADD COLUMN remind_days_after TEXT NOT NULL DEFAULT '[1,3]'",
       "ALTER TABLE tenants ADD COLUMN puc_message_template TEXT",
       "ALTER TABLE tenants ADD COLUMN insurance_message_template TEXT",
-      "ALTER TABLE tenants ADD COLUMN voice_script_template TEXT"
+      "ALTER TABLE tenants ADD COLUMN voice_script_template TEXT",
+      "ALTER TABLE tenants ADD COLUMN is_blocked INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE tenants ADD COLUMN blocked_at TEXT"
     ];
     for (const sql of optionalCols) {
       try { this.sqlite.exec(sql); } catch {}

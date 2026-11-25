@@ -44,6 +44,8 @@ export interface TenantRow {
   insurance_message_template?: string | null;
   voice_script_template?: string | null;
   expiry_warning_days: number;
+  is_blocked?: number | boolean;
+  blocked_at?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -85,10 +87,10 @@ export const DEFAULT_ENGLISH_TEMPLATE =
   'Hello {customer_name}, this is a reminder from {centre_name}. The PUC certificate for your vehicle {vehicle_number} expires on {expiry_date}. Please visit us for timely renewal or call {contact_number}. Thank you.';
 
 export const DEFAULT_WHATSAPP_PUC_TEMPLATE =
-  '🚗 *PUC Renewal Reminder*\n\nHello *{customer_name}*,\n\nThe PUC certificate for your vehicle *{vehicle_number}* is expiring on *{expiry_date}*.\n\nKindly visit *{centre_name}* to renew your certificate and avoid traffic penalties.\n📞 Helpline: {contact_number}\n\nThank you!';
+  'PUC Renewal Reminder\nHello {customer_name},\n\nYour vehicle\'s PUC certificate for {vehicle_number} is expiring on {expiry_date}.\n\nPlease renew your PUC certificate before the expiry date to avoid penalties.\n\n🏢 PUC Centre: {centre_name}\n👤 Owner Name: {owner_name}\n📍 Address: {centre_address}\n📞 Contact Number: {contact_number}\n\nThank you for choosing.';
 
 export const DEFAULT_WHATSAPP_INSURANCE_TEMPLATE =
-  '🛡️ *Vehicle Insurance Renewal Notice*\n\nHello *{customer_name}*,\n\nYour vehicle insurance policy (*{policy_number}* with *{insurance_company}*) for *{vehicle_number}* expires on *{expiry_date}*.\n\nRenew your policy promptly to maintain continuous coverage and zero-break benefits.\n📞 For renewal support: {contact_number}\n\nBest regards,\n*{centre_name}*';
+  'Vehicle Insurance Renewal Reminder\nHello {customer_name},\n\nYour vehicle {vehicle_number} insurance policy is expiring on {expiry_date}.\n\n📄 Policy No.: {policy_number}\n🏢 Insurer: {insurance_company}\n\nRenew your policy on time to avoid a lapse in insurance coverage.\n\nFor Renewal Assistance:\n🏢 Centre: {centre_name}\n👤 Owner: {owner_name}\n📞 Contact: {contact_number}\n\nThank you for your trust! 🙏';
 
 export const ALL_CALL_STATUSES = [
   'queued',
