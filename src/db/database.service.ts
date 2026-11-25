@@ -1,5 +1,5 @@
 import { Injectable, OnModuleDestroy } from '@nestjs/common';
-import Database from 'better-sqlite3';
+import type BetterSqlite3 from 'better-sqlite3';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
@@ -332,7 +332,7 @@ function normalizeParamForSqlite(val: unknown): unknown {
 @Injectable()
 export class DatabaseService implements OnModuleDestroy {
   private pgPool: Pool | null = null;
-  private sqlite: Database.Database | null = null;
+  private sqlite: BetterSqlite3.Database | null = null;
   private engine: DbEngine = 'local-sqlite';
   private initialized = false;
 
@@ -421,7 +421,10 @@ export class DatabaseService implements OnModuleDestroy {
     if (dbPath !== ':memory:') {
       fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     }
-    this.sqlite = new Database(dbPath);
+    // Lazy-load better-sqlite3 only when PostgreSQL is unavailable so production servers without build tools still boot
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const DatabaseCtor = require('better-sqlite3') as typeof BetterSqlite3;
+    this.sqlite = new DatabaseCtor(dbPath);
     this.sqlite.pragma('journal_mode = WAL');
     this.sqlite.pragma('foreign_keys = ON');
     this.sqlite.exec(SQLITE_SCHEMA);
