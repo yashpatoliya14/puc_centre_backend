@@ -429,7 +429,11 @@ export class ReminderEngineService implements OnModuleDestroy {
           }
 
           const slots = this.parseDeliverySlots(tenant.delivery_times, tenant.delivery_frequency_count);
-          const dueSlots = slots.filter((s) => parseHHMM(s) <= nowMinutes);
+          // Only dispatch during the configured slot window [HH:mm, HH:mm + 5m) IST so already-passed times never fire immediately on customer edits
+          const dueSlots = slots.filter((s) => {
+            const slotMin = parseHHMM(s);
+            return nowMinutes >= slotMin && nowMinutes < slotMin + 5;
+          });
           const activeSlots =
             dueSlots.length > 0
               ? dueSlots
