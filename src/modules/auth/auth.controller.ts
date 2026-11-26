@@ -257,6 +257,12 @@ export class AuthController {
         new Date(preVerifiedRow.expires_at).getTime() >= Date.now(),
     );
 
+    if (this.emailService.isConfigured() && !isPreVerified) {
+      throw new BadRequestException(
+        'Email is not verified. Please verify your email with the 6-digit OTP before registering.',
+      );
+    }
+
     const tenantId = crypto.randomUUID();
     const userId = crypto.randomUUID();
     const nowIso = new Date().toISOString();
