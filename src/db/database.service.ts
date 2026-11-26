@@ -340,6 +340,14 @@ CREATE TABLE IF NOT EXISTS whatsapp_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_whatsapp_logs_tenant_day ON whatsapp_logs(tenant_id, dispatch_date_ist, status);
 CREATE INDEX IF NOT EXISTS idx_whatsapp_logs_dedupe ON whatsapp_logs(tenant_id, entity_type, entity_id, dispatch_date_ist, slot_time);
+
+CREATE TABLE IF NOT EXISTS email_verification_codes (
+  email TEXT PRIMARY KEY,
+  code TEXT NOT NULL,
+  verified INTEGER NOT NULL DEFAULT 0,
+  expires_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 `;
 
 function convertPlaceholdersToPg(sql: string): string {
@@ -451,6 +459,13 @@ export class DatabaseService implements OnModuleDestroy {
           );
           CREATE INDEX IF NOT EXISTS idx_whatsapp_logs_tenant_day ON whatsapp_logs(tenant_id, dispatch_date_ist, status);
           CREATE INDEX IF NOT EXISTS idx_whatsapp_logs_dedupe ON whatsapp_logs(tenant_id, entity_type, entity_id, dispatch_date_ist, slot_time);
+          CREATE TABLE IF NOT EXISTS email_verification_codes (
+            email TEXT PRIMARY KEY,
+            code TEXT NOT NULL,
+            verified BOOLEAN NOT NULL DEFAULT FALSE,
+            expires_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT NOW()::text
+          );
         `);
         this.engine = 'supabase-postgresql';
         this.initialized = true;

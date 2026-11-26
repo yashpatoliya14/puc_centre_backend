@@ -156,6 +156,78 @@ export class AuthController {
     };
   }
 
+  @Post('send-registration-otp')
+  async sendRegistrationOtp(
+    @Body() body: { email?: string; ownerName?: string; businessName?: string },
+  ) {
+    const email = String(body?.email || '').trim().toLowerCase();
+    const idError = validateStrongEmailId(email);
+    if (idError) throw new BadRequestException(idError);
+
+    const existing = await this.db.queryOne<{ id: string }>(
+      `SELECT id FROM users WHERE LOWER(email) = ? AND deleted_at IS NULL`,
+      [email],
+    );
+    if (existing) {
+      throw new BadRequestException('An account with this email already exists');
+    }
+
+    const code = this.generateSixDigitCode();
+    const nowIso = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + 15 * 60_000).toISOString();
+
+    await this.db.execute(`DELETE FROM email_verification_codes WHERE LOWER(email) = ?`, [email]);
+    await this.db.execute(
+      `INSERT INTO email_verification_codes (email, code, verified, expires_at, updated_at)
+       VALUES (?, ?, ?, ?, ?)`,
+      [email, code, false, expiresAt, nowIso],
+    );
+
+    if (this.emailService.isConfigured()) {
+      await this.emailService.sendVerificationEmail({
+        to: email,
+        ownerName: String(body?.ownerName || '').trim() || 'PUC Owner',
+        businessName: String(body?.businessName || '').trim() || 'Your PUC Centre',
+        code,
+      });
+      return {
+        ok: true,
+        emailSent: true,
+        message: `6-digit verification code sent to ${email}`,
+      };
+    }
+
+    return {
+      ok: true,
+      emailSent: false,
+      message: 'Verification code generated (configure Brevo sender/SMTP to email it)',
+      previewOtpCode: process.env.NODE_ENV === 'production' ? undefined : code,
+    };
+  }
+
+  @Post('verify-registration-otp')
+  async verifyRegistrationOtp(@Body() body: { email?: string; code?: string }) {
+    const email = String(body?.email || '').trim().toLowerCase();
+    const code = String(body?.code || '').trim();
+    if (!email || !code) {
+      throw new BadRequestException('Email and verification code are required');
+    }
+
+    const row = await this.db.queryOne<{ code: string; expires_at: string }>(
+      `SELECT code, expires_at FROM email_verification_codes WHERE LOWER(email) = ?`,
+      [email],
+    );
+    if (!row || row.code !== code || new Date(row.expires_at).getTime() < Date.now()) {
+      throw new BadRequestException('Invalid or expired verification code');
+    }
+
+    await this.db.execute(
+      `UPDATE email_verification_codes SET verified = ?, updated_at = ? WHERE LOWER(email) = ?`,
+      [true, new Date().toISOString(), email],
+    );
+    return { ok: true, verified: true, message: 'Email verified successfully!' };
+  }
+
   @Post('register')
   async register(@Body() body: unknown, @Req() req: AuthenticatedRequest) {
     const parsed = registerSchema.safeParse(body);
@@ -175,12 +247,24 @@ export class AuthController {
       throw new BadRequestException('An account with this email already exists');
     }
 
+    const preVerifiedRow = await this.db.queryOne<{ verified: number | boolean; expires_at: string }>(
+      `SELECT verified, expires_at FROM email_verification_codes WHERE LOWER(email) = ?`,
+      [email],
+    );
+    const isPreVerified = Boolean(
+      preVerifiedRow &&
+        toBool(preVerifiedRow.verified) &&
+        new Date(preVerifiedRow.expires_at).getTime() >= Date.now(),
+    );
+
     const tenantId = crypto.randomUUID();
     const userId = crypto.randomUUID();
     const nowIso = new Date().toISOString();
-    const verificationCode = this.emailService.isConfigured()
-      ? this.generateSixDigitCode()
-      : generateToken(32);
+    const verificationCode = isPreVerified
+      ? null
+      : this.emailService.isConfigured()
+        ? this.generateSixDigitCode()
+        : generateToken(32);
     const normalizedPhone = normalizeIndianPhone(data.mobileNumber);
 
     await this.db.execute(
@@ -192,8 +276,12 @@ export class AuthController {
     await this.db.execute(
       `INSERT INTO users (id, tenant_id, email, full_name, mobile_number, password_hash, role, email_verified, verification_token, theme_preference, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, 'owner', ?, ?, 'dark', ?, ?)`,
-      [userId, tenantId, email, data.ownerName.trim(), normalizedPhone, hashPassword(data.password), false, verificationCode, nowIso, nowIso],
+      [userId, tenantId, email, data.ownerName.trim(), normalizedPhone, hashPassword(data.password), isPreVerified, verificationCode, nowIso, nowIso],
     );
+
+    if (isPreVerified) {
+      await this.db.execute(`DELETE FROM email_verification_codes WHERE LOWER(email) = ?`, [email]).catch(() => {});
+    }
 
     const resources = await this.seedService.createDefaultTenantResources(tenantId, data.businessName.trim());
     if (data.preloadSampleData) {
@@ -209,7 +297,7 @@ export class AuthController {
       ipAddress: req.ip,
     });
 
-    if (this.emailService.isConfigured()) {
+    if (!isPreVerified && this.emailService.isConfigured() && verificationCode) {
       try {
         await this.emailService.sendVerificationEmail({
           to: email,
@@ -237,7 +325,7 @@ export class AuthController {
     return {
       requiresVerification: false,
       token,
-      verificationToken: verificationCode,
+      verificationToken: verificationCode || undefined,
       ...profile,
     };
   }
