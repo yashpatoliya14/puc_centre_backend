@@ -2,11 +2,17 @@ import * as crypto from 'crypto';
 
 const EPHEMERAL_SESSION_KEY = crypto.randomBytes(32);
 const EPHEMERAL_ENCRYPTION_KEY = crypto.randomBytes(32);
+let warnedMissingSessionSecret = false;
+let warnedMissingEncryptionKey = false;
 
 function getSessionSecret(): Buffer {
   const envSecret = process.env.SESSION_SIGNING_SECRET?.trim();
   if (envSecret && envSecret.length > 0) {
     return crypto.createHash('sha256').update(envSecret).digest();
+  }
+  if (process.env.NODE_ENV === 'production' && !warnedMissingSessionSecret) {
+    warnedMissingSessionSecret = true;
+    console.warn('[Security] SESSION_SIGNING_SECRET is not set in production; using ephemeral session key.');
   }
   return EPHEMERAL_SESSION_KEY;
 }
@@ -18,6 +24,10 @@ function getEncryptionKey(): Buffer {
   }
   if (envKey && envKey.length > 0) {
     return crypto.createHash('sha256').update(envKey).digest();
+  }
+  if (process.env.NODE_ENV === 'production' && !warnedMissingEncryptionKey) {
+    warnedMissingEncryptionKey = true;
+    console.warn('[Security] CREDENTIALS_ENCRYPTION_KEY is not set in production; using ephemeral encryption key.');
   }
   return EPHEMERAL_ENCRYPTION_KEY;
 }

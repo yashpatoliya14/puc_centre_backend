@@ -31,7 +31,7 @@ import {
   toBool,
   type TenantRow,
 } from '../../common/types';
-import { addDaysToDateStr, deriveCertificateStatus, getIstDateString } from '../../common/ist-date.util';
+import { addDaysToDateStr, deriveCertificateStatus, diffDays, getIstDateString } from '../../common/ist-date.util';
 import { TenantAuthGuard, type AuthenticatedRequest } from '../auth/auth.guard';
 import { ReminderEngineService } from '../reminders/reminder-engine.service';
 import { AuditService } from '../audit/audit.service';
@@ -44,7 +44,29 @@ const insuranceInputSchema = z.object({
   policyType: z.string().optional().default('Comprehensive'),
   startDate: z.string().optional().nullable(),
   expiryDate: z.string().optional().nullable(),
-  premiumAmount: z.number().optional().nullable(),
+  premiumAmount: z.number().nonnegative().finite().optional().nullable(),
+});
+
+const customerUpdateSchema = z.object({
+  fullName: z.string().min(2, 'Customer name is required').max(120),
+  mobileNumber: z.string().min(10, 'Valid mobile number required').max(18),
+  alternateMobile: z.string().max(18).optional().nullable(),
+  vehicleRegistrationNumber: z.string().max(25).optional(),
+  registrationNumber: z.string().max(25).optional(),
+  vehicleType: z.string().default('4W'),
+  fuelType: z.string().default('Petrol'),
+  makeModel: z.string().max(100).optional().nullable(),
+  certificateNumber: z.string().max(60).optional().nullable(),
+  issueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Issue date must be YYYY-MM-DD'),
+  expiryDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Expiry date must be YYYY-MM-DD'),
+  address: z.string().max(300).optional().nullable(),
+  notes: z.string().max(600).optional().nullable(),
+  language: z.enum(['gu', 'hi', 'en']).default('gu'),
+  status: z.enum(['active', 'inactive', 'opted_out']).optional(),
+  consentGiven: z.boolean().optional(),
+  dndRegistered: z.boolean().optional(),
+  remindersEnabled: z.boolean().optional(),
+  insurance: insuranceInputSchema.optional().nullable(),
 });
 
 const customerPayloadSchema = z.object({
@@ -127,9 +149,7 @@ export class CustomersController {
       let insStatus: 'active' | 'expiring_soon' | 'expired' = 'active';
       let insDaysLeft: number | null = null;
       if (r.insurance_expiry_date) {
-        const msPerDay = 86400000;
-        const diffMs = new Date(r.insurance_expiry_date).getTime() - new Date(todayIst).getTime();
-        insDaysLeft = Math.round(diffMs / msPerDay);
+        insDaysLeft = diffDays(todayIst, r.insurance_expiry_date.slice(0, 10));
         if (insDaysLeft < 0) insStatus = 'expired';
         else if (insDaysLeft <= 15) insStatus = 'expiring_soon';
       }
@@ -253,7 +273,7 @@ export class CustomersController {
       FROM customers c
       LEFT JOIN vehicles v ON v.customer_id = c.id AND v.tenant_id = c.tenant_id AND v.deleted_at IS NULL
       LEFT JOIN puc_certificates pc ON pc.vehicle_id = v.id AND pc.tenant_id = c.tenant_id AND pc.is_current = ? AND pc.deleted_at IS NULL
-      LEFT JOIN vehicle_insurances vi ON vi.customer_id = c.id AND vi.vehicle_id = v.id AND vi.deleted_at IS NULL
+      LEFT JOIN vehicle_insurances vi ON vi.customer_id = c.id AND vi.vehicle_id = v.id AND vi.tenant_id = c.tenant_id AND vi.deleted_at IS NULL
     `;
 
     const countRow = await this.db.queryOne<{ total: number }>(
@@ -303,7 +323,11 @@ export class CustomersController {
       [true, tenantId],
     );
 
-    const escapeCsv = (v: unknown) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const escapeCsv = (v: unknown) => {
+      const s = String(v ?? '');
+      const safe = /^[=@\t\r]/.test(s) || (/^[+-]/.test(s) && !/^\+\d+$/.test(s)) ? `'${s}` : s;
+      return `"${safe.replace(/"/g, '""')}"`;
+    };
     const header = [
       'Customer Name', 'Mobile Number', 'Alternate Mobile', 'Vehicle Number', 'Vehicle Type',
       'Fuel Type', 'Certificate Number', 'Issue Date', 'Expiry Date', 'Language', 'Status', 'Address', 'Notes',
@@ -337,7 +361,7 @@ export class CustomersController {
        FROM customers c
        LEFT JOIN vehicles v ON v.customer_id = c.id AND v.tenant_id = c.tenant_id AND v.deleted_at IS NULL
        LEFT JOIN puc_certificates pc ON pc.vehicle_id = v.id AND pc.tenant_id = c.tenant_id AND pc.is_current = ? AND pc.deleted_at IS NULL
-       LEFT JOIN vehicle_insurances vi ON vi.customer_id = c.id AND vi.vehicle_id = v.id AND vi.deleted_at IS NULL
+       LEFT JOIN vehicle_insurances vi ON vi.customer_id = c.id AND vi.vehicle_id = v.id AND vi.tenant_id = c.tenant_id AND vi.deleted_at IS NULL
        WHERE c.id = ? AND c.tenant_id = ? AND c.deleted_at IS NULL`,
       [true, id, tenantId],
     );
@@ -422,6 +446,24 @@ export class CustomersController {
       throw new BadRequestException(`Vehicle ${regNo} already exists in your PUC centre.`);
     }
 
+    if (data.insurance?.hasInsurance) {
+      if (!data.insurance.policyNumber?.trim()) {
+        throw new BadRequestException('Insurance policy number is compulsory when insurance is added');
+      }
+      if (!data.insurance.insuranceCompany?.trim()) {
+        throw new BadRequestException('Insurance company name is compulsory when insurance is added');
+      }
+      if (!data.insurance.startDate?.trim()) {
+        throw new BadRequestException('Insurance policy start date is compulsory when insurance is added');
+      }
+      if (!data.insurance.expiryDate?.trim()) {
+        throw new BadRequestException('Insurance policy expiry date is compulsory when insurance is added');
+      }
+      if (data.insurance.expiryDate.trim() < data.insurance.startDate.trim()) {
+        throw new BadRequestException('Insurance expiry date cannot be earlier than policy start date');
+      }
+    }
+
     const nowIso = new Date().toISOString();
     const customerId = crypto.randomUUID();
     const vehicleId = crypto.randomUUID();
@@ -452,19 +494,6 @@ export class CustomersController {
 
     let insuranceId: string | null = null;
     if (data.insurance?.hasInsurance) {
-      if (!data.insurance.policyNumber?.trim()) {
-        throw new BadRequestException('Insurance policy number is compulsory when insurance is added');
-      }
-      if (!data.insurance.insuranceCompany?.trim()) {
-        throw new BadRequestException('Insurance company name is compulsory when insurance is added');
-      }
-      if (!data.insurance.startDate?.trim()) {
-        throw new BadRequestException('Insurance policy start date is compulsory when insurance is added');
-      }
-      if (!data.insurance.expiryDate?.trim()) {
-        throw new BadRequestException('Insurance policy expiry date is compulsory when insurance is added');
-      }
-
       insuranceId = crypto.randomUUID();
       await this.db.execute(
         `INSERT INTO vehicle_insurances (id, tenant_id, customer_id, vehicle_id, policy_number, insurance_company, policy_type, start_date, expiry_date, premium_amount, status, created_at, updated_at)
@@ -474,12 +503,12 @@ export class CustomersController {
           tenantId,
           customerId,
           vehicleId,
-          data.insurance.policyNumber.trim(),
-          data.insurance.insuranceCompany.trim(),
+          data.insurance.policyNumber!.trim(),
+          data.insurance.insuranceCompany!.trim(),
           data.insurance.policyType || 'Comprehensive',
-          data.insurance.startDate.trim(),
-          data.insurance.expiryDate.trim(),
-          data.insurance.premiumAmount || null,
+          data.insurance.startDate!.trim(),
+          data.insurance.expiryDate!.trim(),
+          data.insurance.premiumAmount ?? null,
           nowIso,
           nowIso,
         ],
@@ -513,7 +542,7 @@ export class CustomersController {
         autoCallPlaced = true;
         autoCallStatus = callRes.status;
         autoCallProvider = callRes.providerName;
-        console.log(`[AutoCall] Automatic call placed to registered customer ${data.fullName} (+91 ${phone}): ${callRes.status} via ${callRes.providerName}`);
+        console.log(`[AutoCall] Automatic call placed to registered customer ${data.fullName} (${phone}): ${callRes.status} via ${callRes.providerName}`);
       } catch (callErr) {
         autoCallError = callErr instanceof Error ? callErr.message : String(callErr);
         console.warn(`[AutoCall] Automatic call on registration could not be dispatched:`, autoCallError);
@@ -551,7 +580,7 @@ export class CustomersController {
 
   @Put(':id')
   async update(@Param('id') id: string, @Body() body: unknown, @Req() req: AuthenticatedRequest) {
-    const parsed = customerPayloadSchema.safeParse(body);
+    const parsed = customerUpdateSchema.safeParse(body);
     if (!parsed.success) {
       throw new BadRequestException(parsed.error.issues[0]?.message || 'Invalid customer data');
     }
@@ -559,15 +588,32 @@ export class CustomersController {
     if (data.expiryDate < data.issueDate) {
       throw new BadRequestException('PUC expiry date cannot be earlier than issue date');
     }
+    if (data.insurance?.hasInsurance) {
+      if (!data.insurance.policyNumber?.trim()) throw new BadRequestException('Insurance policy number is compulsory');
+      if (!data.insurance.insuranceCompany?.trim()) throw new BadRequestException('Insurance company is compulsory');
+      if (!data.insurance.startDate?.trim()) throw new BadRequestException('Insurance start date is compulsory');
+      if (!data.insurance.expiryDate?.trim()) throw new BadRequestException('Insurance expiry date is compulsory');
+      if (data.insurance.expiryDate.trim() < data.insurance.startDate.trim()) {
+        throw new BadRequestException('Insurance expiry date cannot be earlier than policy start date');
+      }
+    }
 
     const tenantId = req.auth!.tenantId;
     const existing = await this.db.queryOne<{
       id: string;
+      alternate_mobile: string | null;
+      address: string | null;
+      notes: string | null;
+      status: string;
+      consent_given: number | boolean;
+      dnd_registered: number | boolean;
+      reminders_enabled: number | boolean;
       vehicle_id: string | null;
       certificate_id: string | null;
       expiry_date: string | null;
     }>(
-      `SELECT c.id, v.id as vehicle_id, pc.id as certificate_id, pc.expiry_date
+      `SELECT c.id, c.alternate_mobile, c.address, c.notes, c.status, c.consent_given, c.dnd_registered, c.reminders_enabled,
+              v.id as vehicle_id, pc.id as certificate_id, pc.expiry_date
        FROM customers c
        LEFT JOIN vehicles v ON v.customer_id = c.id AND v.tenant_id = c.tenant_id AND v.deleted_at IS NULL
        LEFT JOIN puc_certificates pc ON pc.vehicle_id = v.id AND pc.tenant_id = c.tenant_id AND pc.is_current = ? AND pc.deleted_at IS NULL
@@ -577,7 +623,19 @@ export class CustomersController {
     if (!existing) throw new NotFoundException('Customer not found');
 
     const phone = normalizeIndianPhone(data.mobileNumber);
-    const altPhone = data.alternateMobile ? normalizeIndianPhone(data.alternateMobile) : null;
+    const altPhone =
+      data.alternateMobile !== undefined
+        ? data.alternateMobile
+          ? normalizeIndianPhone(data.alternateMobile)
+          : null
+        : existing.alternate_mobile;
+    const nextAddress = data.address !== undefined ? data.address?.trim() || null : existing.address;
+    const nextNotes = data.notes !== undefined ? data.notes?.trim() || null : existing.notes;
+    const nextStatus = data.status ?? existing.status;
+    const nextConsent = data.consentGiven ?? toBool(existing.consent_given);
+    const nextDnd = data.dndRegistered ?? toBool(existing.dnd_registered);
+    const nextRemindersEnabled = data.remindersEnabled ?? toBool(existing.reminders_enabled);
+
     const regRaw = (data.registrationNumber || data.vehicleRegistrationNumber || '').trim();
     if (!regRaw || regRaw.length < 3) {
       throw new BadRequestException('Vehicle registration number is required');
@@ -612,8 +670,8 @@ export class CustomersController {
            language = ?, status = ?, consent_given = ?, dnd_registered = ?, reminders_enabled = ?, updated_at = ?
        WHERE id = ? AND tenant_id = ?`,
       [
-        data.fullName.trim(), phone, altPhone, data.address?.trim() || null, data.notes?.trim() || null,
-        data.language, data.status, data.consentGiven, data.dndRegistered, data.remindersEnabled, nowIso,
+        data.fullName.trim(), phone, altPhone, nextAddress, nextNotes,
+        data.language, nextStatus, nextConsent, nextDnd, nextRemindersEnabled, nowIso,
         id, tenantId,
       ],
     );
@@ -635,26 +693,30 @@ export class CustomersController {
     }
 
     let rescheduled = false;
+    let activeCertId = existing.certificate_id;
     if (existing.certificate_id) {
       await this.db.execute(
         `UPDATE puc_certificates SET certificate_number = ?, issue_date = ?, expiry_date = ?, updated_at = ?
          WHERE id = ? AND tenant_id = ?`,
         [data.certificateNumber?.trim() || null, data.issueDate, data.expiryDate, nowIso, existing.certificate_id, tenantId],
       );
-      // Business rule #13: Cancel stale scheduled jobs when certificate expiry dates change!
       if (existing.expiry_date && existing.expiry_date !== data.expiryDate) {
         await this.reminderEngine.rescheduleOnExpiryChange(tenantId, id, existing.certificate_id, data.expiryDate);
         rescheduled = true;
       }
     } else {
-      const certId = crypto.randomUUID();
+      activeCertId = crypto.randomUUID();
       await this.db.execute(
         `INSERT INTO puc_certificates (id, tenant_id, customer_id, vehicle_id, certificate_number, issue_date, expiry_date, cycle_status, is_current, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
-        [certId, tenantId, id, vehicleId, data.certificateNumber?.trim() || null, data.issueDate, data.expiryDate, true, nowIso, nowIso],
+        [activeCertId, tenantId, id, vehicleId, data.certificateNumber?.trim() || null, data.issueDate, data.expiryDate, true, nowIso, nowIso],
       );
-      await this.reminderEngine.generateScheduleForCertificate(tenantId, id, certId, data.expiryDate);
+      await this.reminderEngine.generateScheduleForCertificate(tenantId, id, activeCertId, data.expiryDate);
       rescheduled = true;
+    }
+
+    if (activeCertId && (nextStatus === 'opted_out' || !nextConsent || nextDnd || !nextRemindersEnabled)) {
+      await this.reminderEngine.cancelPendingForCertificate(tenantId, activeCertId, 'Customer opted out / DND / reminders disabled');
     }
 
     if (data.insurance !== undefined) {
@@ -663,23 +725,18 @@ export class CustomersController {
         [id, tenantId],
       );
       if (data.insurance?.hasInsurance) {
-        if (!data.insurance.policyNumber?.trim()) throw new BadRequestException('Insurance policy number is compulsory');
-        if (!data.insurance.insuranceCompany?.trim()) throw new BadRequestException('Insurance company is compulsory');
-        if (!data.insurance.startDate?.trim()) throw new BadRequestException('Insurance start date is compulsory');
-        if (!data.insurance.expiryDate?.trim()) throw new BadRequestException('Insurance expiry date is compulsory');
-
         if (existingIns) {
           await this.db.execute(
             `UPDATE vehicle_insurances
              SET policy_number = ?, insurance_company = ?, policy_type = ?, start_date = ?, expiry_date = ?, premium_amount = ?, updated_at = ?
              WHERE id = ? AND tenant_id = ?`,
             [
-              data.insurance.policyNumber.trim(),
-              data.insurance.insuranceCompany.trim(),
+              data.insurance.policyNumber!.trim(),
+              data.insurance.insuranceCompany!.trim(),
               data.insurance.policyType || 'Comprehensive',
-              data.insurance.startDate.trim(),
-              data.insurance.expiryDate.trim(),
-              data.insurance.premiumAmount || null,
+              data.insurance.startDate!.trim(),
+              data.insurance.expiryDate!.trim(),
+              data.insurance.premiumAmount ?? null,
               nowIso,
               existingIns.id,
               tenantId,
@@ -694,12 +751,12 @@ export class CustomersController {
               tenantId,
               id,
               vehicleId,
-              data.insurance.policyNumber.trim(),
-              data.insurance.insuranceCompany.trim(),
+              data.insurance.policyNumber!.trim(),
+              data.insurance.insuranceCompany!.trim(),
               data.insurance.policyType || 'Comprehensive',
-              data.insurance.startDate.trim(),
-              data.insurance.expiryDate.trim(),
-              data.insurance.premiumAmount || null,
+              data.insurance.startDate!.trim(),
+              data.insurance.expiryDate!.trim(),
+              data.insurance.premiumAmount ?? null,
               nowIso,
               nowIso,
             ],
@@ -825,16 +882,17 @@ export class CustomersController {
       `SELECT id, registration_number FROM vehicles WHERE customer_id = ? AND tenant_id = ? AND deleted_at IS NULL LIMIT 1`,
       [id, tenantId],
     );
-    const cert = await this.db.queryOne<{ expiry_date: string }>(
-      `SELECT expiry_date FROM puc_certificates WHERE customer_id = ? AND tenant_id = ? AND is_current = ? AND deleted_at IS NULL LIMIT 1`,
+    const cert = await this.db.queryOne<{ id: string; expiry_date: string }>(
+      `SELECT id, expiry_date FROM puc_certificates WHERE customer_id = ? AND tenant_id = ? AND is_current = ? AND deleted_at IS NULL LIMIT 1`,
       [id, tenantId, true],
     );
     const insurance = await this.db.queryOne<{
+      id: string;
       policy_number: string;
       insurance_company: string;
       expiry_date: string;
     }>(
-      `SELECT policy_number, insurance_company, expiry_date FROM vehicle_insurances WHERE customer_id = ? AND tenant_id = ? AND deleted_at IS NULL LIMIT 1`,
+      `SELECT id, policy_number, insurance_company, expiry_date FROM vehicle_insurances WHERE customer_id = ? AND tenant_id = ? AND deleted_at IS NULL LIMIT 1`,
       [id, tenantId],
     );
 
@@ -878,6 +936,7 @@ export class CustomersController {
         });
       }
 
+      const loggedEntityId = type === 'insurance' ? (insurance?.id || customer.id) : (cert?.id || customer.id);
       await this.db.execute(
         `INSERT INTO whatsapp_logs (id, tenant_id, customer_id, vehicle_id, entity_type, entity_id, reminder_offset_days, dispatch_date_ist, slot_time, template_name, phone_number, provider_message_id, status, created_at)
          VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'manual', ?, ?, ?, 'sent', ?)`,
@@ -887,7 +946,7 @@ export class CustomersController {
           customer.id,
           vehicle?.id || null,
           type,
-          cert?.expiry_date || customer.id,
+          loggedEntityId,
           todayIst,
           sendRes.template,
           customer.mobile_number,
@@ -1006,6 +1065,12 @@ export class CustomersController {
     }
 
     const tenantId = req.auth!.tenantId;
+    const customer = await this.db.queryOne<{ id: string }>(
+      `SELECT id FROM customers WHERE id = ? AND tenant_id = ? AND deleted_at IS NULL`,
+      [id, tenantId],
+    );
+    if (!customer) throw new NotFoundException('Customer not found');
+
     const vehicle = await this.db.queryOne<{ id: string; registration_number: string }>(
       `SELECT id, registration_number FROM vehicles WHERE customer_id = ? AND tenant_id = ? AND deleted_at IS NULL LIMIT 1`,
       [id, tenantId],
@@ -1149,7 +1214,15 @@ export class CustomersController {
       if (!firstSheet) throw new BadRequestException('Uploaded file has no worksheets');
       rawRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(workbook.Sheets[firstSheet], { defval: '' });
     } else if (body?.rows) {
-      rawRows = typeof body.rows === 'string' ? JSON.parse(body.rows) : (body.rows as Record<string, unknown>[]);
+      if (typeof body.rows === 'string') {
+        try {
+          rawRows = JSON.parse(body.rows);
+        } catch {
+          throw new BadRequestException('Invalid JSON format in rows payload');
+        }
+      } else {
+        rawRows = body.rows as Record<string, unknown>[];
+      }
     }
 
     if (!Array.isArray(rawRows) || rawRows.length === 0) {
@@ -1218,27 +1291,50 @@ export class CustomersController {
         continue;
       }
 
+      const phoneDigits = rawPhone.replace(/\D/g, '');
+      if (phoneDigits.length < 10) {
+        skipped++;
+        errors.push({ row: i + 2, reason: `Invalid mobile number (${rawPhone})` });
+        continue;
+      }
+
       const phone = normalizeIndianPhone(rawPhone);
       const regNo = normalizeVehicleReg(rawReg);
+      const compactReg = regNo.replace(/[^A-Z0-9]/g, '');
       const expiryDate = normalizeDate(rawExpiry, addDaysToDateStr(todayIst, 180));
       const issueDate = normalizeDate(rawIssue, addDaysToDateStr(expiryDate, -180));
+      if (expiryDate < issueDate) {
+        skipped++;
+        errors.push({ row: i + 2, reason: `Expiry date (${expiryDate}) cannot be earlier than issue date (${issueDate})` });
+        continue;
+      }
 
-      const vehicleType = (['2W', '3W', '4W', 'LCV', 'HCV'].includes(rawVType) ? rawVType : '4W') as '2W' | '3W' | '4W' | 'LCV' | 'HCV';
-      const fuelType = ['Petrol', 'Diesel', 'CNG', 'LPG', 'Hybrid'].find(
+      const vehicleType =
+        rawVType.includes('2') || rawVType === '2W'
+          ? '2-Wheeler'
+          : rawVType.includes('4') || rawVType === '4W'
+            ? '4-Wheeler'
+            : ['LCV', 'HCV', 'COMMERCIAL'].some((k) => rawVType.includes(k))
+              ? 'Commercial'
+              : rawVType.includes('3') || rawVType === 'OTHER'
+                ? 'Other'
+                : '4-Wheeler';
+      const fuelType = ['Petrol', 'Diesel', 'CNG', 'LPG', 'Hybrid', 'Electric'].find(
         (f) => f.toLowerCase() === rawFuel.toLowerCase(),
       ) || 'Petrol';
       const language = rawLang.startsWith('hi') ? 'hi' : rawLang.startsWith('en') ? 'en' : rawLang.startsWith('gu') ? 'gu' : defaultLang;
 
       const dup = await this.db.queryOne<{ id: string }>(
-        `SELECT v.id FROM vehicles v WHERE v.tenant_id = ? AND v.registration_number = ? AND v.deleted_at IS NULL
-         UNION ALL
-         SELECT c.id FROM customers c WHERE c.tenant_id = ? AND c.mobile_number = ? AND c.deleted_at IS NULL
+        `SELECT v.id FROM vehicles v
+         WHERE v.tenant_id = ?
+           AND REPLACE(REPLACE(UPPER(v.registration_number), ' ', ''), '-', '') = ?
+           AND v.deleted_at IS NULL
          LIMIT 1`,
-        [tenantId, regNo, tenantId, phone],
+        [tenantId, compactReg],
       );
       if (dup) {
         skipped++;
-        errors.push({ row: i + 2, reason: `Duplicate mobile (${phone}) or vehicle (${regNo})` });
+        errors.push({ row: i + 2, reason: `Duplicate vehicle (${regNo})` });
         continue;
       }
 

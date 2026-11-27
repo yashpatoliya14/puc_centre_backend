@@ -39,8 +39,13 @@ export function getIstDateString(date: Date = new Date()): string {
 }
 
 export function addDaysToDateStr(dateStr: string, days: number): string {
-  const [y, m, d] = dateStr.split('-').map(Number);
+  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec((dateStr || '').trim());
+  if (!match) return dateStr;
+  const y = Number(match[1]);
+  const m = Number(match[2]);
+  const d = Number(match[3]);
   const utc = Date.UTC(y, m - 1, d) + days * 24 * 60 * 60 * 1000;
+  if (Number.isNaN(utc)) return dateStr;
   const result = new Date(utc);
   return `${result.getUTCFullYear()}-${String(result.getUTCMonth() + 1).padStart(2, '0')}-${String(
     result.getUTCDate(),
@@ -48,10 +53,11 @@ export function addDaysToDateStr(dateStr: string, days: number): string {
 }
 
 export function diffDays(fromDateStr: string, toDateStr: string): number {
-  const [y1, m1, d1] = fromDateStr.split('-').map(Number);
-  const [y2, m2, d2] = toDateStr.split('-').map(Number);
-  const t1 = Date.UTC(y1, m1 - 1, d1);
-  const t2 = Date.UTC(y2, m2 - 1, d2);
+  const m1Match = /^(\d{4})-(\d{2})-(\d{2})/.exec((fromDateStr || '').trim());
+  const m2Match = /^(\d{4})-(\d{2})-(\d{2})/.exec((toDateStr || '').trim());
+  if (!m1Match || !m2Match) return 0;
+  const t1 = Date.UTC(Number(m1Match[1]), Number(m1Match[2]) - 1, Number(m1Match[3]));
+  const t2 = Date.UTC(Number(m2Match[1]), Number(m2Match[2]) - 1, Number(m2Match[3]));
   return Math.round((t2 - t1) / (24 * 60 * 60 * 1000));
 }
 

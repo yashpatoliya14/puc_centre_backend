@@ -351,9 +351,27 @@ CREATE TABLE IF NOT EXISTS email_verification_codes (
 `;
 
 function convertPlaceholdersToPg(sql: string): string {
-  let idx = 0;
   const pgSql = sql.replace(/SUBSTR\((\w+\.?\w+),\s*1,\s*10\)/gi, 'SUBSTR(CAST($1 AS TEXT), 1, 10)');
-  return pgSql.replace(/\?/g, () => `$${++idx}`);
+  let idx = 0;
+  let out = '';
+  let inSingleQuote = false;
+  for (let i = 0; i < pgSql.length; i++) {
+    const ch = pgSql[i];
+    if (ch === "'") {
+      if (inSingleQuote && pgSql[i + 1] === "'") {
+        out += "''";
+        i++;
+        continue;
+      }
+      inSingleQuote = !inSingleQuote;
+      out += ch;
+    } else if (ch === '?' && !inSingleQuote) {
+      out += `$${++idx}`;
+    } else {
+      out += ch;
+    }
+  }
+  return out;
 }
 
 function normalizeParamForSqlite(val: unknown): unknown {

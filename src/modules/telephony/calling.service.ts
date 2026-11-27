@@ -340,7 +340,7 @@ export class CallingService {
     const callerId = row?.caller_id || process.env.EXOTEL_CALLER_ID || '';
     const appUrl = row?.app_url || process.env.EXOTEL_APP_URL || '';
     const webhookSecret = decryptSecret(row?.webhook_secret_encrypted) || process.env.EXOTEL_WEBHOOK_SECRET || '';
-    const subdomain = process.env.EXOTEL_SUBDOMAIN || row?.subdomain || 'api.exotel.com';
+    const subdomain = row?.subdomain || process.env.EXOTEL_SUBDOMAIN || 'api.exotel.com';
 
     const hasLiveCreds = Boolean(accountSid && apiKey && apiToken && callerId);
     const mode: 'mock' | 'live' = (row?.mode === 'live' || (!row?.account_sid && hasLiveCreds)) && hasLiveCreds ? 'live' : 'mock';

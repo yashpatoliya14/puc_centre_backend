@@ -363,7 +363,11 @@ export class ReminderEngineService implements OnModuleDestroy {
         }
 
         // Calling window check in Asia/Kolkata
-        const callingDays = JSON.parse(tenant.calling_days_json || '[1,2,3,4,5,6]') as number[];
+        let callingDays = [1, 2, 3, 4, 5, 6];
+        try {
+          const parsedDays = JSON.parse(tenant.calling_days_json || '[1,2,3,4,5,6]');
+          if (Array.isArray(parsedDays)) callingDays = parsedDays;
+        } catch {}
         if (!options.ignoreWindow && !isWithinCallingWindow(callingDays, tenant.calling_window_start, tenant.calling_window_end, now)) {
           deferredWindow++;
           continue;
@@ -795,10 +799,21 @@ export class ReminderEngineService implements OnModuleDestroy {
       if (cc.campaign_status === 'stopped') {
         await this.db.execute(`UPDATE call_jobs SET status = 'cancelled', last_error = 'Campaign stopped', updated_at = ? WHERE id = ?`, [nowIso, job.id]);
         await this.db.execute(`UPDATE campaign_customers SET status = 'cancelled', updated_at = ? WHERE id = ?`, [nowIso, job.campaign_customer_id]);
+        await this.recomputeCampaignStats(job.tenant_id, cc.campaign_id);
         return { dispatched: false, reason: 'Campaign stopped' };
       }
       campaignId = cc.campaign_id;
       campaignTemplateId = cc.voice_template_id;
+    }
+
+    // Atomically claim job before dialing so concurrent workers cannot double-dial
+    const claimed = await this.db.execute(
+      `UPDATE call_jobs SET status = 'processing', updated_at = ?
+       WHERE id = ? AND status IN ('scheduled', 'queued', 'retrying')`,
+      [nowIso, job.id],
+    );
+    if (claimed.rowCount === 0) {
+      return { dispatched: false, reason: 'Job is already being processed' };
     }
 
     // Verify certificate has not already been renewed
@@ -816,6 +831,10 @@ export class ReminderEngineService implements OnModuleDestroy {
         if (job.reminder_event_id) {
           await this.db.execute(`UPDATE reminder_events SET status = 'cancelled', skip_reason = 'PUC already renewed', updated_at = ? WHERE id = ?`, [nowIso, job.reminder_event_id]);
         }
+        if (job.campaign_customer_id) {
+          await this.db.execute(`UPDATE campaign_customers SET status = 'skipped', skip_reason = 'PUC already renewed', updated_at = ? WHERE id = ?`, [nowIso, job.campaign_customer_id]);
+        }
+        if (campaignId) await this.recomputeCampaignStats(job.tenant_id, campaignId);
         return { dispatched: false, reason: 'PUC certificate already renewed' };
       }
     }
@@ -833,13 +852,22 @@ export class ReminderEngineService implements OnModuleDestroy {
 
     if (!customer) {
       await this.db.execute(`UPDATE call_jobs SET status = 'cancelled', last_error = 'Customer deleted', updated_at = ? WHERE id = ?`, [nowIso, job.id]);
+      if (job.campaign_customer_id) {
+        await this.db.execute(`UPDATE campaign_customers SET status = 'skipped', skip_reason = 'Customer deleted', updated_at = ? WHERE id = ?`, [nowIso, job.campaign_customer_id]);
+      }
+      if (campaignId) await this.recomputeCampaignStats(job.tenant_id, campaignId);
       return { dispatched: false, reason: 'Customer deleted' };
     }
 
-    const countRow = await this.db.queryOne<{ cnt: number }>(
-      `SELECT COUNT(*) as cnt FROM call_logs WHERE tenant_id = ? AND customer_id = ? AND (? IS NULL OR certificate_id = ?) AND status != 'cancelled'`,
-      [job.tenant_id, customer.id, job.certificate_id, job.certificate_id],
-    );
+    const countRow = job.certificate_id
+      ? await this.db.queryOne<{ cnt: number }>(
+          `SELECT COUNT(*) as cnt FROM call_logs WHERE tenant_id = ? AND customer_id = ? AND certificate_id = ? AND status != 'cancelled'`,
+          [job.tenant_id, customer.id, job.certificate_id],
+        )
+      : await this.db.queryOne<{ cnt: number }>(
+          `SELECT COUNT(*) as cnt FROM call_logs WHERE tenant_id = ? AND customer_id = ? AND status != 'cancelled'`,
+          [job.tenant_id, customer.id],
+        );
     const eligibility = evaluateCallingEligibility(tenant, customer, Number(countRow?.cnt || 0), {
       isCampaign: Boolean(job.campaign_customer_id),
     });
@@ -852,6 +880,7 @@ export class ReminderEngineService implements OnModuleDestroy {
       if (job.campaign_customer_id) {
         await this.db.execute(`UPDATE campaign_customers SET status = 'skipped', skip_reason = ?, updated_at = ? WHERE id = ?`, [eligibility.reason || 'Ineligible', nowIso, job.campaign_customer_id]);
       }
+      if (campaignId) await this.recomputeCampaignStats(job.tenant_id, campaignId);
       return { dispatched: false, reason: eligibility.reason };
     }
 
@@ -883,8 +912,7 @@ export class ReminderEngineService implements OnModuleDestroy {
       ruleTemplateId,
     );
 
-    // Mark job processing and insert call_log BEFORE calling provider
-    await this.db.execute(`UPDATE call_jobs SET status = 'processing', updated_at = ? WHERE id = ?`, [nowIso, job.id]);
+    // Update reminder_event & insert call_log BEFORE calling provider
     if (job.reminder_event_id) {
       await this.db.execute(`UPDATE reminder_events SET status = 'dispatched', updated_at = ? WHERE id = ?`, [nowIso, job.reminder_event_id]);
     }
@@ -928,6 +956,7 @@ export class ReminderEngineService implements OnModuleDestroy {
         [providerRes.providerName, providerRes.errorMessage || 'Provider request failed', nowIso, nowIso, callLogId],
       );
       await this.scheduleRetryOrFail(job.id, job.tenant_id, job.attempt_number, job.max_attempts, tenant.retry_interval_minutes, providerRes.errorMessage || 'Provider failure', job.campaign_customer_id, now);
+      if (campaignId) await this.recomputeCampaignStats(job.tenant_id, campaignId);
       return { dispatched: true, callLogId };
     }
 
@@ -1070,8 +1099,9 @@ export class ReminderEngineService implements OnModuleDestroy {
       tenant_id: string;
       call_job_id: string | null;
       campaign_id: string | null;
+      status: string;
     }>(
-      `SELECT id, tenant_id, call_job_id, campaign_id FROM call_logs
+      `SELECT id, tenant_id, call_job_id, campaign_id, status FROM call_logs
        WHERE provider_call_id = ? OR id = ?
        LIMIT 1`,
       [event.providerCallId, event.customField || ''],
@@ -1079,9 +1109,14 @@ export class ReminderEngineService implements OnModuleDestroy {
 
     if (!log) return { updated: false };
 
+    const terminalStatuses = ['completed', 'no_answer', 'busy', 'failed', 'cancelled'];
+    const isTerminal = terminalStatuses.includes(event.status);
+    if (terminalStatuses.includes(log.status) && !isTerminal) {
+      return { updated: false, callLogId: log.id, status: log.status as CallStatus };
+    }
+
     const now = options.now ?? new Date();
     const nowIso = now.toISOString();
-    const isTerminal = ['completed', 'no_answer', 'busy', 'failed', 'cancelled'].includes(event.status);
 
     await this.db.execute(
       `UPDATE call_logs
@@ -1126,6 +1161,14 @@ export class ReminderEngineService implements OnModuleDestroy {
           }
           if (job.campaign_customer_id) {
             await this.db.execute(`UPDATE campaign_customers SET status = 'completed', updated_at = ? WHERE id = ?`, [nowIso, job.campaign_customer_id]);
+          }
+        } else if (event.status === 'cancelled') {
+          await this.db.execute(`UPDATE call_jobs SET status = 'cancelled', last_error = 'Call cancelled by provider', updated_at = ? WHERE id = ?`, [nowIso, job.id]);
+          if (job.reminder_event_id) {
+            await this.db.execute(`UPDATE reminder_events SET status = 'cancelled', skip_reason = 'Call cancelled by provider', updated_at = ? WHERE id = ?`, [nowIso, job.reminder_event_id]);
+          }
+          if (job.campaign_customer_id) {
+            await this.db.execute(`UPDATE campaign_customers SET status = 'cancelled', skip_reason = 'Call cancelled by provider', updated_at = ? WHERE id = ?`, [nowIso, job.campaign_customer_id]);
           }
         } else if (['no_answer', 'busy', 'failed'].includes(event.status)) {
           retryScheduled = await this.scheduleRetryOrFail(

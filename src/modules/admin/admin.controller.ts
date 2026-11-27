@@ -27,7 +27,11 @@ import { AuditService } from '../audit/audit.service';
 const createAdminSchema = z.object({
   fullName: z.string().min(2, 'Admin full name is required').max(100),
   email: z.string().email('Valid Admin ID (email) is required'),
-  mobileNumber: z.string().min(10, 'Valid 10-digit mobile number is required').max(18),
+  mobileNumber: z
+    .string()
+    .min(10, 'Valid 10-digit mobile number is required')
+    .max(18)
+    .refine((v) => v.replace(/\D/g, '').length >= 10, 'Valid 10-digit mobile number is required'),
   password: z.string().min(10, 'Password must be at least 10 characters').max(100),
 });
 
@@ -243,7 +247,7 @@ export class AdminController {
        FROM customers c
        LEFT JOIN vehicles v ON v.customer_id = c.id AND v.tenant_id = c.tenant_id AND v.deleted_at IS NULL
        LEFT JOIN puc_certificates pc ON pc.vehicle_id = v.id AND pc.tenant_id = c.tenant_id AND pc.is_current = ? AND pc.deleted_at IS NULL
-       LEFT JOIN vehicle_insurances vi ON vi.customer_id = c.id AND vi.vehicle_id = v.id AND vi.deleted_at IS NULL
+       LEFT JOIN vehicle_insurances vi ON vi.customer_id = c.id AND vi.vehicle_id = v.id AND vi.tenant_id = c.tenant_id AND vi.deleted_at IS NULL
        WHERE ${conditions.join(' AND ')}
        ORDER BY COALESCE(pc.expiry_date, '9999-12-31') ASC, c.created_at DESC`,
       params,

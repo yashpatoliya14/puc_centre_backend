@@ -5,6 +5,8 @@ import {
   Delete,
   ForbiddenException,
   Get,
+  HttpException,
+  HttpStatus,
   Inject,
   Param,
   Post,
@@ -38,7 +40,6 @@ const registerSchema = z.object({
   email: z.string().email('Valid email required'),
   password: z.string().min(10, 'Password must be at least 10 characters').max(100),
   address: z.string().max(300).optional(),
-  preloadSampleData: z.boolean().optional().default(true),
 });
 
 const loginSchema = z.object({
@@ -59,6 +60,8 @@ const changePasswordSchema = z.object({
 
 @Controller('api/auth')
 export class AuthController {
+  private readonly authAttempts = new Map<string, number[]>();
+
   constructor(
     @Inject(DatabaseService) private readonly db: DatabaseService,
     @Inject(SeedService) private readonly seedService: SeedService,
@@ -66,6 +69,28 @@ export class AuthController {
     @Inject(ReminderEngineService) private readonly reminderEngine: ReminderEngineService,
     @Inject(EmailService) private readonly emailService: EmailService,
   ) {}
+
+  private assertNotRateLimited(key: string, maxAttempts: number, windowMs = 15 * 60_000): void {
+    const now = Date.now();
+    const recent = (this.authAttempts.get(key) || []).filter((ts) => now - ts < windowMs);
+    if (recent.length >= maxAttempts) {
+      this.authAttempts.set(key, recent);
+      throw new HttpException('Too many attempts. Please try again in a few minutes.', HttpStatus.TOO_MANY_REQUESTS);
+    }
+    this.authAttempts.set(key, recent);
+  }
+
+  private recordFailedAttempt(key: string, windowMs = 15 * 60_000): number {
+    const now = Date.now();
+    const recent = (this.authAttempts.get(key) || []).filter((ts) => now - ts < windowMs);
+    recent.push(now);
+    this.authAttempts.set(key, recent);
+    return recent.length;
+  }
+
+  private clearAttempts(key: string): void {
+    this.authAttempts.delete(key);
+  }
 
   private generateSixDigitCode(): string {
     return crypto.randomInt(100000, 999999).toString();
@@ -142,6 +167,7 @@ export class AuthController {
         logoUrl: tenant.logo_url,
         timezone: tenant.timezone,
         automationEnabled: toBool(tenant.automation_enabled),
+        messagesEnabled: toBool(tenant.messages_enabled ?? true),
         defaultLanguage: tenant.default_language,
         defaultCallTime: tenant.default_call_time,
         callingWindowStart: tenant.calling_window_start,
@@ -213,14 +239,22 @@ export class AuthController {
       throw new BadRequestException('Email and verification code are required');
     }
 
+    const attemptKey = `reg-otp:${email}`;
+    this.assertNotRateLimited(attemptKey, 5);
+
     const row = await this.db.queryOne<{ code: string; expires_at: string }>(
       `SELECT code, expires_at FROM email_verification_codes WHERE LOWER(email) = ?`,
       [email],
     );
     if (!row || row.code !== code || new Date(row.expires_at).getTime() < Date.now()) {
+      const failures = this.recordFailedAttempt(attemptKey);
+      if (failures >= 5) {
+        await this.db.execute(`DELETE FROM email_verification_codes WHERE LOWER(email) = ?`, [email]).catch(() => {});
+      }
       throw new BadRequestException('Invalid or expired verification code');
     }
 
+    this.clearAttempts(attemptKey);
     await this.db.execute(
       `UPDATE email_verification_codes SET verified = ?, updated_at = ? WHERE LOWER(email) = ?`,
       [true, new Date().toISOString(), email],
@@ -273,25 +307,27 @@ export class AuthController {
         : generateToken(32);
     const normalizedPhone = normalizeIndianPhone(data.mobileNumber);
 
-    await this.db.execute(
-      `INSERT INTO tenants (id, business_name, owner_name, mobile_number, email, address, timezone, automation_enabled, auto_schedule_on_import, default_language, default_call_time, calling_window_start, calling_window_end, calling_days_json, max_attempts, retry_interval_minutes, max_calls_per_customer, expiry_warning_days, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'Asia/Kolkata', ?, ?, 'gu', '10:00', '09:30', '19:30', '[1,2,3,4,5,6]', 3, 60, 6, 7, ?, ?)`,
-      [tenantId, data.businessName.trim(), data.ownerName.trim(), normalizedPhone, email, data.address?.trim() || null, true, true, nowIso, nowIso],
-    );
+    try {
+      await this.db.execute(
+        `INSERT INTO tenants (id, business_name, owner_name, mobile_number, email, address, timezone, automation_enabled, auto_schedule_on_import, default_language, default_call_time, calling_window_start, calling_window_end, calling_days_json, max_attempts, retry_interval_minutes, max_calls_per_customer, expiry_warning_days, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'Asia/Kolkata', ?, ?, 'gu', '10:00', '09:30', '19:30', '[1,2,3,4,5,6]', 3, 60, 6, 7, ?, ?)`,
+        [tenantId, data.businessName.trim(), data.ownerName.trim(), normalizedPhone, email, data.address?.trim() || null, true, true, nowIso, nowIso],
+      );
 
-    await this.db.execute(
-      `INSERT INTO users (id, tenant_id, email, full_name, mobile_number, password_hash, role, email_verified, verification_token, theme_preference, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'owner', ?, ?, 'dark', ?, ?)`,
-      [userId, tenantId, email, data.ownerName.trim(), normalizedPhone, hashPassword(data.password), isPreVerified, verificationCode, nowIso, nowIso],
-    );
+      await this.db.execute(
+        `INSERT INTO users (id, tenant_id, email, full_name, mobile_number, password_hash, role, email_verified, verification_token, theme_preference, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'owner', ?, ?, 'dark', ?, ?)`,
+        [userId, tenantId, email, data.ownerName.trim(), normalizedPhone, hashPassword(data.password), isPreVerified, verificationCode, nowIso, nowIso],
+      );
 
-    if (isPreVerified) {
-      await this.db.execute(`DELETE FROM email_verification_codes WHERE LOWER(email) = ?`, [email]).catch(() => {});
-    }
+      if (isPreVerified) {
+        await this.db.execute(`DELETE FROM email_verification_codes WHERE LOWER(email) = ?`, [email]).catch(() => {});
+      }
 
-    const resources = await this.seedService.createDefaultTenantResources(tenantId, data.businessName.trim());
-    if (data.preloadSampleData) {
-      await this.seedService.seedSampleCentreData(tenantId, userId, resources);
+      await this.seedService.createDefaultTenantResources(tenantId, data.businessName.trim());
+    } catch (err) {
+      await this.db.execute(`DELETE FROM tenants WHERE id = ?`, [tenantId]).catch(() => {});
+      throw err;
     }
 
     await this.auditService.log({
@@ -343,13 +379,18 @@ export class AuthController {
       throw new BadRequestException('Please enter a valid email and password');
     }
     const email = parsed.data.email.trim().toLowerCase();
+    const attemptKey = `login:${email}:${req.ip || 'local'}`;
+    this.assertNotRateLimited(attemptKey, 10);
+
     const user = await this.db.queryOne<UserRow>(
       `SELECT * FROM users WHERE email = ? AND deleted_at IS NULL`,
       [email],
     );
     if (!user || !verifyPassword(parsed.data.password, user.password_hash)) {
+      this.recordFailedAttempt(attemptKey);
       throw new UnauthorizedException('Invalid email or password');
     }
+    this.clearAttempts(attemptKey);
 
     const tenant = await this.db.queryOne<{ is_blocked?: number | boolean; deleted_at: string | null }>(
       `SELECT is_blocked, deleted_at FROM tenants WHERE id = ?`,
@@ -414,6 +455,13 @@ export class AuthController {
     if (!user || !verifyPassword(DEMO_PASSWORD, user.password_hash)) {
       throw new UnauthorizedException('Demo workspace unavailable');
     }
+    const tenant = await this.db.queryOne<{ is_blocked?: number | boolean; deleted_at: string | null }>(
+      `SELECT is_blocked, deleted_at FROM tenants WHERE id = ?`,
+      [user.tenant_id],
+    );
+    if (!tenant || tenant.deleted_at || toBool(tenant.is_blocked)) {
+      throw new UnauthorizedException('Demo workspace unavailable');
+    }
     const token = await this.createSession(user, req);
     const profile = await this.buildAuthPayload(user.id, user.tenant_id);
     return { token, ...profile };
@@ -444,6 +492,12 @@ export class AuthController {
     const verificationCode = String(body?.code || body?.token || '').trim();
     const email = String(body?.email || '').trim().toLowerCase();
     if (!verificationCode) throw new BadRequestException('Verification code is required');
+    if (verificationCode.length < 32 && !email) {
+      throw new BadRequestException('Email is required to verify a 6-digit code');
+    }
+
+    const attemptKey = `verify-email:${email || 'token'}`;
+    this.assertNotRateLimited(attemptKey, 5);
 
     const user = email
       ? await this.db.queryOne<UserRow>(
@@ -455,8 +509,18 @@ export class AuthController {
           [verificationCode],
         );
 
-    if (!user) throw new BadRequestException('Invalid or expired verification code');
+    if (!user) {
+      const failures = this.recordFailedAttempt(attemptKey);
+      if (email && failures >= 5) {
+        await this.db.execute(
+          `UPDATE users SET verification_token = NULL, updated_at = ? WHERE LOWER(email) = ?`,
+          [new Date().toISOString(), email],
+        ).catch(() => {});
+      }
+      throw new BadRequestException('Invalid or expired verification code');
+    }
 
+    this.clearAttempts(attemptKey);
     await this.db.execute(
       `UPDATE users SET email_verified = ?, verification_token = NULL, updated_at = ? WHERE id = ?`,
       [true, new Date().toISOString(), user.id],
@@ -566,18 +630,34 @@ export class AuthController {
     const pwdError = validateStrongPassword(parsed.data.newPassword);
     if (pwdError) throw new BadRequestException(pwdError);
     const email = parsed.data.email?.trim().toLowerCase();
+    const token = parsed.data.token.trim();
+    if (token.length < 32 && !email) {
+      throw new BadRequestException('Email is required to verify a 6-digit reset code');
+    }
+
+    const attemptKey = `reset-pwd:${email || 'token'}`;
+    this.assertNotRateLimited(attemptKey, 5);
+
     const user = email
       ? await this.db.queryOne<UserRow>(
           `SELECT * FROM users WHERE LOWER(email) = ? AND reset_token = ? AND deleted_at IS NULL`,
-          [email, parsed.data.token.trim()],
+          [email, token],
         )
       : await this.db.queryOne<UserRow>(
           `SELECT * FROM users WHERE reset_token = ? AND deleted_at IS NULL`,
-          [parsed.data.token.trim()],
+          [token],
         );
     if (!user || !user.reset_token_expires_at || new Date(user.reset_token_expires_at).getTime() < Date.now()) {
+      const failures = this.recordFailedAttempt(attemptKey);
+      if (email && failures >= 5) {
+        await this.db.execute(
+          `UPDATE users SET reset_token = NULL, reset_token_expires_at = NULL, updated_at = ? WHERE LOWER(email) = ?`,
+          [new Date().toISOString(), email],
+        ).catch(() => {});
+      }
       throw new BadRequestException('Reset code is invalid or expired');
     }
+    this.clearAttempts(attemptKey);
     const nowIso = new Date().toISOString();
     await this.db.execute(
       `UPDATE users SET password_hash = ?, reset_token = NULL, reset_token_expires_at = NULL, updated_at = ? WHERE id = ?`,

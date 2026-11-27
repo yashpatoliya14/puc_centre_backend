@@ -3,12 +3,14 @@ import {
   Post,
   Get,
   Body,
+  Headers,
   Query,
   UploadedFile,
   UseInterceptors,
   UseGuards,
   Req,
   BadRequestException,
+  UnauthorizedException,
   Logger,
 } from '@nestjs/common';
 import * as crypto from 'crypto';
@@ -17,6 +19,8 @@ import { TenantAuthGuard, type AuthenticatedRequest } from '../auth/auth.guard';
 import { ScannerService, ExtractedPucData } from './scanner.service';
 import { DatabaseService } from '../../db/database.service';
 import { getIstDateString, addDaysToDateStr } from '../../common/ist-date.util';
+import { normalizeIndianPhone, toBool } from '../../common/types';
+import { verifyHmacSignature } from '../../common/crypto.util';
 import { ReminderEngineService } from '../reminders/reminder-engine.service';
 import { AuditService } from '../audit/audit.service';
 
@@ -113,11 +117,11 @@ export class ScannerController {
       [tenantId],
     );
 
-    const shouldSchedule = tenant ? Boolean(tenant.auto_schedule_on_import) : true;
+    const shouldSchedule = tenant ? toBool(tenant.auto_schedule_on_import) : true;
     const defaultLang = tenant?.default_language || 'gu';
 
     let registered = 0;
-    let updated = 0;
+    const updated = 0;
     const errors: Array<{ index: number; regNumber: string; error: string }> = [];
     const results: Array<{
       regNumber: string;
@@ -134,6 +138,13 @@ export class ScannerController {
       const rawReg = (c.regNumber || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
       if (!rawReg || rawReg.length < 5) {
         errors.push({ index: i, regNumber: c.regNumber || 'UNKNOWN', error: 'Invalid vehicle plate number' });
+        results.push({
+          regNumber: c.regNumber || 'UNKNOWN',
+          customerName: (c.customName || c.fullName || 'Unknown').trim(),
+          vehicleType: c.vehicleType || '4-Wheeler',
+          expiryDate: c.expiryDate || '',
+          status: 'failed',
+        });
         continue;
       }
       if (seenRegsInBatch.has(rawReg)) {
@@ -154,14 +165,13 @@ export class ScannerController {
       seenRegsInBatch.add(rawReg);
 
       const fullName = (c.customName || c.fullName || `Customer (${rawReg})`).trim();
-      let phone = (c.customMobile || c.mobileNumber || '').replace(/\D/g, '');
-      if (phone.length === 10) {
-        phone = `+91${phone}`;
-      } else if (phone.length === 12 && phone.startsWith('91')) {
-        phone = `+${phone}`;
-      } else if (!phone || phone.length < 10) {
-        phone = tenant?.mobile_number ? `+91${tenant.mobile_number.slice(-10)}` : '+919999999999';
-      }
+      const rawDigits = (c.customMobile || c.mobileNumber || '').replace(/\D/g, '').replace(/^0+(?=\d{10}$)/, '');
+      const phone =
+        rawDigits.length >= 10
+          ? normalizeIndianPhone(rawDigits.slice(-10))
+          : tenant?.mobile_number
+            ? normalizeIndianPhone(tenant.mobile_number)
+            : '+919999999999';
 
       const vType = ([
         '2W',
@@ -177,8 +187,14 @@ export class ScannerController {
       const fuel = c.fuelType || 'Petrol';
       const issueDate = c.issueDate || todayIst;
       const expiryDate = c.expiryDate || addDaysToDateStr(issueDate, 365);
+      if (expiryDate < issueDate) {
+        errors.push({ index: i, regNumber: rawReg, error: 'Expiry date cannot be earlier than issue date' });
+        results.push({ regNumber: rawReg, customerName: fullName, vehicleType: vType, expiryDate, status: 'failed' });
+        continue;
+      }
       const certNo = c.certificateNumber?.trim() || null;
 
+      let createdCustomerId: string | null = null;
       try {
         const existingVehicle = await this.db.queryOne<{ id: string; customer_id: string }>(
           `SELECT id, customer_id FROM vehicles WHERE tenant_id = ? AND REPLACE(REPLACE(UPPER(registration_number), ' ', ''), '-', '') = ? AND deleted_at IS NULL`,
@@ -202,6 +218,7 @@ export class ScannerController {
           // Same mobile number may be shared across multiple registrations in a PUC centre;
           // only the vehicle number plate is strictly unique per centre.
           const customerId = crypto.randomUUID();
+          createdCustomerId = customerId;
           await this.db.execute(
             `INSERT INTO customers (id, tenant_id, full_name, mobile_number, language, status, consent_given, dnd_registered, reminders_enabled, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)`,
@@ -236,8 +253,12 @@ export class ScannerController {
           });
         }
       } catch (err: unknown) {
+        if (createdCustomerId) {
+          await this.db.execute(`DELETE FROM customers WHERE id = ? AND tenant_id = ?`, [createdCustomerId, tenantId]).catch(() => {});
+        }
         const errorMsg = err instanceof Error ? err.message : 'Database registration error';
         errors.push({ index: i, regNumber: rawReg, error: errorMsg });
+        results.push({ regNumber: rawReg, customerName: fullName, vehicleType: vType, expiryDate, status: 'failed' });
       }
     }
 
@@ -268,7 +289,31 @@ export class ScannerController {
    * or parsed from incoming WhatsApp webhook with image caption.
    */
   @Post('whatsapp-bot')
-  async handleWhatsAppBotWebhook(@Body() body: Record<string, unknown>, @Req() req: any) {
+  async handleWhatsAppBotWebhook(
+    @Body() body: Record<string, unknown>,
+    @Headers('x-hub-signature-256') hubSignature: string | undefined,
+    @Headers('x-webhook-secret') webhookSecretHeader: string | undefined,
+    @Query('secret') secretQuery: string | undefined,
+  ) {
+    const appSecret = process.env.WHATSAPP_APP_SECRET?.trim();
+    const verifyToken = process.env.WHATSAPP_WEBHOOK_VERIFY_TOKEN?.trim();
+
+    if (appSecret && hubSignature) {
+      const validSig = verifyHmacSignature(JSON.stringify(body || {}), hubSignature, appSecret);
+      if (!validSig) {
+        throw new UnauthorizedException('Invalid WhatsApp webhook signature');
+      }
+    } else if (verifyToken) {
+      const provided = (webhookSecretHeader || secretQuery || '').trim();
+      const a = Buffer.from(provided, 'utf8');
+      const b = Buffer.from(verifyToken, 'utf8');
+      if (!provided || a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+        throw new UnauthorizedException('Invalid WhatsApp bot webhook secret');
+      }
+    } else {
+      throw new UnauthorizedException('WhatsApp bot webhook verification is not configured');
+    }
+
     this.logger.log(`Received WhatsApp Bot webhook payload: ${JSON.stringify(body).slice(0, 200)}`);
 
     // Flexible extraction from Meta Cloud API, Twilio, or generic webhook body
@@ -276,17 +321,14 @@ export class ScannerController {
     let messageText = '';
 
     if (body?.entry && Array.isArray(body.entry)) {
-      // Meta Cloud API structure
       const changes = (body.entry[0] as any)?.changes?.[0]?.value;
       const message = changes?.messages?.[0];
-      senderNumber = message?.from || '';
-      messageText = message?.text?.body || message?.caption || '';
+      senderNumber = String(message?.from || '');
+      messageText = String(message?.text?.body || message?.caption || '');
     } else if (body?.From || body?.Body) {
-      // Twilio format
       senderNumber = String(body.From || '').replace(/whatsapp:\+?/, '');
       messageText = String(body.Body || '');
     } else {
-      // Generic payload: { mobileNumber: "...", text: "..." }
       senderNumber = String(body.mobileNumber || body.sender || '');
       messageText = String(body.text || body.message || '');
     }
@@ -295,24 +337,30 @@ export class ScannerController {
       return { ok: true, message: 'No text or caption to process' };
     }
 
-    // Try parsing as QR string or Parivahan text
-    const extracted = this.scannerService.parseQrString(messageText);
-
-    // If registration number is found, we can lookup the tenant by senderNumber or default tenant
-    let tenant = await this.db.queryOne<{ id: string; business_name: string }>(
-      `SELECT id, business_name FROM tenants WHERE mobile_number LIKE ? LIMIT 1`,
-      [`%${senderNumber.slice(-10)}%`],
-    );
-
-    if (!tenant) {
-      // Fallback to first active tenant
-      tenant = await this.db.queryOne<{ id: string; business_name: string }>(
-        `SELECT id, business_name FROM tenants ORDER BY created_at ASC LIMIT 1`,
-        [],
-      );
+    const senderDigits = senderNumber.replace(/\D/g, '').slice(-10);
+    if (senderDigits.length !== 10) {
+      throw new BadRequestException('Valid 10-digit sender mobile number is required');
     }
 
-    if (!tenant || !extracted.regNumber) {
+    const extracted = this.scannerService.parseQrString(messageText);
+    const tenant = await this.db.queryOne<{
+      id: string;
+      business_name: string;
+      auto_schedule_on_import: number | boolean;
+      is_blocked: number | boolean | null;
+    }>(
+      `SELECT id, business_name, auto_schedule_on_import, is_blocked
+       FROM tenants
+       WHERE deleted_at IS NULL AND mobile_number LIKE ?
+       LIMIT 1`,
+      [`%${senderDigits}`],
+    );
+
+    if (!tenant || toBool(tenant.is_blocked)) {
+      throw new UnauthorizedException('Sender mobile number is not authorized for an active PUC centre');
+    }
+
+    if (!extracted.regNumber) {
       return {
         ok: false,
         message: 'Could not extract valid vehicle number from message',
@@ -320,7 +368,6 @@ export class ScannerController {
       };
     }
 
-    // Auto-create or update customer record in the tenant's database
     const customerId = crypto.randomUUID();
     const vehicleId = crypto.randomUUID();
     const certId = crypto.randomUUID();
@@ -328,48 +375,64 @@ export class ScannerController {
     const today = getIstDateString();
 
     const fullName = extracted.fullName || 'Registered via WhatsApp';
-    const mobile = extracted.mobileNumber || senderNumber.slice(-10);
+    const mobile = normalizeIndianPhone(extracted.mobileNumber || senderDigits);
     const regNo = extracted.regNumber;
+    const issueDate = extracted.issueDate || today;
+    const expiryDate = extracted.expiryDate || addDaysToDateStr(issueDate, 365);
 
-    // Check if vehicle already exists for this tenant
     const existingVehicle = await this.db.queryOne<{ id: string; customer_id: string }>(
-      `SELECT id, customer_id FROM vehicles WHERE tenant_id = ? AND UPPER(REPLACE(registration_number, ' ', '')) = ? AND deleted_at IS NULL`,
-      [tenant.id, regNo],
+      `SELECT id, customer_id FROM vehicles
+       WHERE tenant_id = ? AND REPLACE(REPLACE(UPPER(registration_number), ' ', ''), '-', '') = ? AND deleted_at IS NULL`,
+      [tenant.id, regNo.replace(/[^A-Z0-9]/g, '')],
     );
 
+    let targetCustomerId: string = customerId;
     if (existingVehicle) {
-      await this.db.execute(
-        `UPDATE puc_certificates SET is_current = ? WHERE vehicle_id = ? AND tenant_id = ?`,
-        [false, existingVehicle.id, tenant.id],
+      targetCustomerId = existingVehicle.customer_id;
+      const oldCerts = await this.db.query<{ id: string }>(
+        `SELECT id FROM puc_certificates WHERE vehicle_id = ? AND tenant_id = ? AND is_current = ? AND deleted_at IS NULL`,
+        [existingVehicle.id, tenant.id, true],
       );
+      for (const old of oldCerts) {
+        await this.db.execute(
+          `UPDATE puc_certificates SET cycle_status = 'renewed', is_current = ?, renewed_at = ?, updated_at = ?
+           WHERE id = ? AND tenant_id = ?`,
+          [false, nowIso, nowIso, old.id, tenant.id],
+        );
+        await this.reminderEngine.cancelPendingForCertificate(tenant.id, old.id, 'PUC certificate renewed via WhatsApp bot');
+      }
       await this.db.execute(
         `INSERT INTO puc_certificates (id, tenant_id, customer_id, vehicle_id, certificate_number, issue_date, expiry_date, cycle_status, is_current, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
-        [certId, tenant.id, existingVehicle.customer_id, existingVehicle.id, extracted.certificateNumber || null, extracted.issueDate || today, extracted.expiryDate || today, true, nowIso, nowIso],
+        [certId, tenant.id, existingVehicle.customer_id, existingVehicle.id, extracted.certificateNumber || null, issueDate, expiryDate, true, nowIso, nowIso],
       );
     } else {
-      let cust = await this.db.queryOne<{ id: string }>(
+      const cust = await this.db.queryOne<{ id: string }>(
         `SELECT id FROM customers WHERE tenant_id = ? AND mobile_number = ? AND deleted_at IS NULL`,
         [tenant.id, mobile],
       );
-      const targetCustId = cust ? cust.id : customerId;
+      targetCustomerId = cust ? cust.id : customerId;
       if (!cust) {
         await this.db.execute(
           `INSERT INTO customers (id, tenant_id, full_name, mobile_number, language, status, consent_given, dnd_registered, reminders_enabled, created_at, updated_at)
            VALUES (?, ?, ?, ?, 'gu', 'active', ?, ?, ?, ?, ?)`,
-          [targetCustId, tenant.id, fullName, mobile, true, false, true, nowIso, nowIso],
+          [targetCustomerId, tenant.id, fullName, mobile, true, false, true, nowIso, nowIso],
         );
       }
       await this.db.execute(
         `INSERT INTO vehicles (id, tenant_id, customer_id, registration_number, vehicle_type, fuel_type, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [vehicleId, tenant.id, targetCustId, regNo, extracted.vehicleType || '4-Wheeler', extracted.fuelType || 'Petrol', nowIso, nowIso],
+        [vehicleId, tenant.id, targetCustomerId, regNo, extracted.vehicleType || '4-Wheeler', extracted.fuelType || 'Petrol', nowIso, nowIso],
       );
       await this.db.execute(
         `INSERT INTO puc_certificates (id, tenant_id, customer_id, vehicle_id, certificate_number, issue_date, expiry_date, cycle_status, is_current, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
-        [certId, tenant.id, targetCustId, vehicleId, extracted.certificateNumber || null, extracted.issueDate || today, extracted.expiryDate || today, true, nowIso, nowIso],
+        [certId, tenant.id, targetCustomerId, vehicleId, extracted.certificateNumber || null, issueDate, expiryDate, true, nowIso, nowIso],
       );
+    }
+
+    if (toBool(tenant.auto_schedule_on_import)) {
+      await this.reminderEngine.generateScheduleForCertificate(tenant.id, targetCustomerId, certId, expiryDate);
     }
 
     return {
@@ -377,7 +440,7 @@ export class ScannerController {
       message: `Vehicle ${extracted.regNumber} registered successfully for ${tenant.business_name}`,
       data: {
         regNumber: extracted.regNumber,
-        expiryDate: extracted.expiryDate,
+        expiryDate,
         mobileNumber: mobile,
       },
     };

@@ -404,7 +404,11 @@ export class AutomationController {
        LIMIT 2000`,
       [req.auth!.tenantId],
     );
-    const esc = (v: unknown) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const esc = (v: unknown) => {
+      const s = String(v ?? '');
+      const safe = /^[=@\t\r]/.test(s) || (/^[+-]/.test(s) && !/^\+\d+$/.test(s)) ? `'${s}` : s;
+      return `"${safe.replace(/"/g, '""')}"`;
+    };
     const header = ['Call Date', 'Customer Name', 'Phone Number', 'Vehicle Number', 'Duration (s)', 'Status', 'Reminder Type', 'Label', 'Campaign', 'Provider', 'Provider Call ID'];
     const lines = [header.join(',')];
     for (const r of rows) {
@@ -741,11 +745,14 @@ export class AutomationController {
         job = { id: jobId, status: 'queued' };
       } else if (job.status === 'scheduled' || job.status === 'retrying') {
         await this.db.execute(`UPDATE call_jobs SET status = 'queued', next_run_at = ?, updated_at = ? WHERE id = ?`, [nowIso, nowIso, job.id]);
+        job.status = 'queued';
       }
 
-      await this.db.execute(`UPDATE campaign_customers SET status = 'queued', updated_at = ? WHERE id = ?`, [nowIso, target.id]);
-      const outcome = await this.reminderEngine.executeCallJob(job.id, { ignoreWindow: true });
-      if (outcome.dispatched) dispatched++;
+      if (['scheduled', 'queued', 'retrying'].includes(job.status)) {
+        await this.db.execute(`UPDATE campaign_customers SET status = 'queued', updated_at = ? WHERE id = ?`, [nowIso, target.id]);
+        const outcome = await this.reminderEngine.executeCallJob(job.id, { ignoreWindow: true });
+        if (outcome.dispatched) dispatched++;
+      }
     }
 
     await this.reminderEngine.recomputeCampaignStats(tenantId, campaignId);
@@ -824,12 +831,20 @@ export class AutomationController {
       throw new BadRequestException('Invalid telephony webhook payload');
     }
 
-    // Look up owning tenant to validate HMAC signature
+    // Look up owning tenant to validate webhook authenticity & mode
     const existingLog = await this.db.queryOne<{ tenant_id: string }>(
       `SELECT tenant_id FROM call_logs WHERE provider_call_id = ? OR id = ? LIMIT 1`,
       [event.providerCallId, event.customField || ''],
     );
-    if (existingLog && provider === 'exotel') {
+    if (!existingLog) {
+      throw new NotFoundException('Call log not found for telephony webhook');
+    }
+
+    const telConfig = await this.callingService.resolveTenantProviderConfig(existingLog.tenant_id);
+    if (provider !== 'exotel' && telConfig.mode === 'live') {
+      throw new BadRequestException('Mock webhook rejected for live telephony tenant');
+    }
+    if (provider === 'exotel') {
       const rawBody = JSON.stringify(req.body || {});
       const valid = await this.callingService.verifyWebhookSignature(existingLog.tenant_id, rawBody, signatureHeader);
       if (!valid) {

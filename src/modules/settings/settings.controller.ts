@@ -2,7 +2,8 @@ import { BadRequestException, Body, Controller, Get, Inject, Post, Put, Req, Use
 import crypto from 'crypto';
 import { z } from 'zod';
 import { DatabaseService } from '../../db/database.service';
-import { encryptSecret } from '../../common/crypto.util';
+import { encryptSecret, validateStrongEmailId } from '../../common/crypto.util';
+import { parseHHMM } from '../../common/ist-date.util';
 import {
   DEFAULT_GUJARATI_TEMPLATE,
   DEFAULT_WHATSAPP_INSURANCE_TEMPLATE,
@@ -18,18 +19,18 @@ import { AuditService } from '../audit/audit.service';
 import { ReminderEngineService } from '../reminders/reminder-engine.service';
 
 const simplifiedSettingsSchema = z.object({
-  callsEnabled: z.boolean(),
-  autoCallOnRegistration: z.boolean().default(true).optional(),
+  callsEnabled: z.boolean().optional(),
+  autoCallOnRegistration: z.boolean().optional(),
   messagesEnabled: z.boolean(),
-  maxCallsPerCustomer: z.number().int().min(1).max(20).default(3),
+  maxCallsPerCustomer: z.number().int().min(1).max(20).optional(),
   retryIntervalMinutes: z.number().int().min(5).max(1440).default(60),
   maxMessagesPerCustomer: z.number().int().min(1).max(20).default(3),
   dailyMessageLimit: z.number().int().min(1).max(10000).default(100),
   deliveryFrequency: z.string().min(2).max(40).default('1x_daily'),
   deliveryFrequencyCount: z.number().int().min(1).max(24).default(1),
   deliveryTimes: z.array(z.string().regex(/^\d{2}:\d{2}$/)).max(24).default(['10:00']),
-  callingWindowStart: z.string().regex(/^\d{2}:\d{2}$/).default('09:30'),
-  callingWindowEnd: z.string().regex(/^\d{2}:\d{2}$/).default('19:30'),
+  callingWindowStart: z.string().regex(/^\d{2}:\d{2}$/).optional(),
+  callingWindowEnd: z.string().regex(/^\d{2}:\d{2}$/).optional(),
   remindDaysBefore: z.array(z.number().int().min(0).max(365)).default([7, 3, 0]),
   remindDaysAfter: z.array(z.number().int().min(1).max(365)).default([1, 3]),
   pucMessageTemplate: z.string().min(5).max(2000).optional(),
@@ -38,8 +39,8 @@ const simplifiedSettingsSchema = z.object({
   businessName: z.string().min(2).max(120).optional(),
   ownerName: z.string().min(2).max(100).optional(),
   mobileNumber: z.string().min(10).max(18).optional(),
-  provider: z.enum(['exotel', 'mock']).optional().default('exotel'),
-  mode: z.enum(['mock', 'live']).optional().default('live'),
+  provider: z.enum(['exotel', 'mock']).optional(),
+  mode: z.enum(['mock', 'live']).optional(),
   accountSid: z.string().max(100).optional().nullable(),
   subdomain: z.string().max(120).optional().nullable(),
   apiKey: z.string().max(200).optional().nullable(),
@@ -115,6 +116,16 @@ export class SettingsController {
     @Inject(ReminderEngineService) private readonly reminderEngine: ReminderEngineService,
   ) {}
 
+  private safeJsonArray<T>(raw: string | null | undefined, fallback: T[]): T[] {
+    if (!raw) return fallback;
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) && parsed.length > 0 ? (parsed as T[]) : fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
   @Get()
   async getAll(@Req() req: AuthenticatedRequest) {
     const tenantId = req.auth!.tenantId;
@@ -149,20 +160,13 @@ export class SettingsController {
         dailyMessageLimit: tenant.daily_message_limit || 100,
         deliveryFrequency: tenant.delivery_frequency || '1x_daily',
         deliveryFrequencyCount: tenant.delivery_frequency_count || 1,
-        deliveryTimes: (() => {
-          try {
-            const parsed = JSON.parse(tenant.delivery_times || '["10:00"]');
-            return Array.isArray(parsed) && parsed.length > 0 ? parsed : ['10:00'];
-          } catch {
-            return ['10:00'];
-          }
-        })(),
+        deliveryTimes: this.safeJsonArray<string>(tenant.delivery_times, ['10:00']),
         callingWindowStart: tenant.calling_window_start || '09:30',
         callingWindowEnd: tenant.calling_window_end || '19:30',
-        remindDaysBefore: JSON.parse(tenant.remind_days_before || '[7,3,0]') as number[],
-        remindDaysAfter: JSON.parse(tenant.remind_days_after || '[1,3]') as number[],
-        pucMessageTemplate: DEFAULT_WHATSAPP_PUC_TEMPLATE,
-        insuranceMessageTemplate: DEFAULT_WHATSAPP_INSURANCE_TEMPLATE,
+        remindDaysBefore: this.safeJsonArray<number>(tenant.remind_days_before, [7, 3, 0]),
+        remindDaysAfter: this.safeJsonArray<number>(tenant.remind_days_after, [1, 3]),
+        pucMessageTemplate: tenant.puc_message_template || DEFAULT_WHATSAPP_PUC_TEMPLATE,
+        insuranceMessageTemplate: tenant.insurance_message_template || DEFAULT_WHATSAPP_INSURANCE_TEMPLATE,
         voiceScriptTemplate: tenant.voice_script_template || DEFAULT_GUJARATI_TEMPLATE,
         businessName: tenant.business_name,
         ownerName: tenant.owner_name,
@@ -195,7 +199,7 @@ export class SettingsController {
         defaultCallTime: tenant.default_call_time,
         callingWindowStart: tenant.calling_window_start,
         callingWindowEnd: tenant.calling_window_end,
-        callingDays: JSON.parse(tenant.calling_days_json || '[1,2,3,4,5,6]') as number[],
+        callingDays: this.safeJsonArray<number>(tenant.calling_days_json, [1, 2, 3, 4, 5, 6]),
         maxAttempts: tenant.max_attempts,
         retryIntervalMinutes: tenant.retry_interval_minutes,
         maxCallsPerCustomer: tenant.max_calls_per_customer,
@@ -247,10 +251,25 @@ export class SettingsController {
     const tenantId = req.auth!.tenantId;
     const nowIso = new Date().toISOString();
 
+    const existingTenant = await this.db.queryOne<TenantRow>(`SELECT * FROM tenants WHERE id = ?`, [tenantId]);
+    if (!existingTenant) throw new BadRequestException('Tenant not found');
+
+    const windowStart = d.callingWindowStart ?? existingTenant.calling_window_start ?? '09:30';
+    const windowEnd = d.callingWindowEnd ?? existingTenant.calling_window_end ?? '19:30';
+    if (parseHHMM(windowStart) >= parseHHMM(windowEnd)) {
+      throw new BadRequestException('Calling window start time must be earlier than end time');
+    }
+
+    const callsEnabled = d.callsEnabled ?? toBool(existingTenant.calls_enabled ?? existingTenant.automation_enabled ?? true);
+    const autoCallOnRegistration = d.autoCallOnRegistration ?? toBool(existingTenant.auto_call_on_registration ?? true);
+    const maxCallsPerCustomer = d.maxCallsPerCustomer ?? (existingTenant.max_calls_per_customer || 3);
+
     const daysBefore = Array.from(new Set(d.remindDaysBefore)).sort((a, b) => b - a);
     const daysAfter = Array.from(new Set(d.remindDaysAfter)).sort((a, b) => a - b);
     const freqCount = Math.min(24, Math.max(1, d.deliveryFrequencyCount || 1));
-    const normalizedTimes = Array.from({ length: freqCount }, (_, idx) => d.deliveryTimes[idx] || '10:00');
+    const normalizedTimes = Array.from(
+      new Set(Array.from({ length: freqCount }, (_, idx) => d.deliveryTimes[idx] || '10:00')),
+    ).sort((a, b) => parseHHMM(a) - parseHHMM(b));
 
     await this.db.execute(
       `UPDATE tenants
@@ -269,19 +288,19 @@ export class SettingsController {
            updated_at = ?
        WHERE id = ?`,
       [
-        d.callsEnabled,
-        d.autoCallOnRegistration ?? true,
+        callsEnabled,
+        autoCallOnRegistration,
         d.messagesEnabled,
-        d.callsEnabled,
-        d.maxCallsPerCustomer,
+        callsEnabled,
+        maxCallsPerCustomer,
         d.retryIntervalMinutes,
         d.maxMessagesPerCustomer,
         d.dailyMessageLimit,
-        `${freqCount}x_daily`,
-        freqCount,
+        `${normalizedTimes.length}x_daily`,
+        normalizedTimes.length,
         JSON.stringify(normalizedTimes),
-        d.callingWindowStart,
-        d.callingWindowEnd,
+        windowStart,
+        windowEnd,
         JSON.stringify(daysBefore),
         JSON.stringify(daysAfter),
         d.pucMessageTemplate ?? null,
@@ -332,54 +351,82 @@ export class SettingsController {
       }
     }
 
-    const existingTel = await this.db.queryOne<{
-      id: string;
-      api_key_encrypted: string | null;
-      api_token_encrypted: string | null;
-      webhook_secret_encrypted: string | null;
-    }>(`SELECT * FROM telephony_configurations WHERE tenant_id = ?`, [tenantId]);
+    // Cancel pending call_jobs for rules that are no longer active
+    await this.db.execute(
+      `UPDATE call_jobs SET status = 'cancelled', last_error = 'Reminder rule disabled in settings', updated_at = ?
+       WHERE tenant_id = ? AND status IN ('scheduled', 'queued') AND reminder_event_id IN (
+         SELECT re.id FROM reminder_events re
+         INNER JOIN reminder_rules rr ON rr.id = re.reminder_rule_id
+         WHERE re.tenant_id = ? AND rr.is_active = ?
+       )`,
+      [nowIso, tenantId, tenantId, false],
+    );
 
-    const encKey = d.apiKey && d.apiKey.trim() ? encryptSecret(d.apiKey.trim()) : existingTel?.api_key_encrypted || null;
-    const encToken = d.apiToken && d.apiToken.trim() ? encryptSecret(d.apiToken.trim()) : existingTel?.api_token_encrypted || null;
+    const hasTelephonyInput =
+      d.provider !== undefined ||
+      d.mode !== undefined ||
+      d.accountSid !== undefined ||
+      d.subdomain !== undefined ||
+      d.apiKey !== undefined ||
+      d.apiToken !== undefined ||
+      d.callerId !== undefined ||
+      d.appUrl !== undefined;
 
-    if (existingTel) {
-      await this.db.execute(
-        `UPDATE telephony_configurations
-         SET provider = ?, mode = ?, account_sid = ?, subdomain = ?,
-             api_key_encrypted = ?, api_token_encrypted = ?, caller_id = ?, app_url = ?, updated_at = ?
-         WHERE tenant_id = ?`,
-        [
-          d.provider || 'exotel',
-          d.mode || 'live',
-          d.accountSid?.trim() || null,
-          d.subdomain?.trim() || 'api.exotel.com',
-          encKey,
-          encToken,
-          d.callerId?.trim() || null,
-          d.appUrl?.trim() || null,
-          nowIso,
-          tenantId,
-        ],
-      );
-    } else {
-      await this.db.execute(
-        `INSERT INTO telephony_configurations (id, tenant_id, provider, mode, account_sid, subdomain, api_key_encrypted, api_token_encrypted, caller_id, app_url, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          crypto.randomUUID(),
-          tenantId,
-          d.provider || 'exotel',
-          d.mode || 'live',
-          d.accountSid?.trim() || null,
-          d.subdomain?.trim() || 'api.exotel.com',
-          encKey,
-          encToken,
-          d.callerId?.trim() || null,
-          d.appUrl?.trim() || null,
-          nowIso,
-          nowIso,
-        ],
-      );
+    if (hasTelephonyInput) {
+      const existingTel = await this.db.queryOne<{
+        id: string;
+        provider: string;
+        mode: string;
+        account_sid: string | null;
+        subdomain: string;
+        api_key_encrypted: string | null;
+        api_token_encrypted: string | null;
+        caller_id: string | null;
+        app_url: string | null;
+      }>(`SELECT * FROM telephony_configurations WHERE tenant_id = ?`, [tenantId]);
+
+      const encKey = d.apiKey && d.apiKey.trim() ? encryptSecret(d.apiKey.trim()) : existingTel?.api_key_encrypted || null;
+      const encToken = d.apiToken && d.apiToken.trim() ? encryptSecret(d.apiToken.trim()) : existingTel?.api_token_encrypted || null;
+
+      if (existingTel) {
+        await this.db.execute(
+          `UPDATE telephony_configurations
+           SET provider = ?, mode = ?, account_sid = ?, subdomain = ?,
+               api_key_encrypted = ?, api_token_encrypted = ?, caller_id = ?, app_url = ?, updated_at = ?
+           WHERE tenant_id = ?`,
+          [
+            d.provider ?? existingTel.provider,
+            d.mode ?? existingTel.mode,
+            d.accountSid !== undefined ? d.accountSid?.trim() || null : existingTel.account_sid,
+            d.subdomain !== undefined ? d.subdomain?.trim() || 'api.exotel.com' : existingTel.subdomain,
+            encKey,
+            encToken,
+            d.callerId !== undefined ? d.callerId?.trim() || null : existingTel.caller_id,
+            d.appUrl !== undefined ? d.appUrl?.trim() || null : existingTel.app_url,
+            nowIso,
+            tenantId,
+          ],
+        );
+      } else {
+        await this.db.execute(
+          `INSERT INTO telephony_configurations (id, tenant_id, provider, mode, account_sid, subdomain, api_key_encrypted, api_token_encrypted, caller_id, app_url, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            crypto.randomUUID(),
+            tenantId,
+            d.provider || 'exotel',
+            d.mode || 'mock',
+            d.accountSid?.trim() || null,
+            d.subdomain?.trim() || 'api.exotel.com',
+            encKey,
+            encToken,
+            d.callerId?.trim() || null,
+            d.appUrl?.trim() || null,
+            nowIso,
+            nowIso,
+          ],
+        );
+      }
     }
 
     await this.auditService.log({
@@ -388,7 +435,7 @@ export class SettingsController {
       action: 'settings.updated',
       entityType: 'tenant',
       metadata: {
-        callsEnabled: d.callsEnabled,
+        callsEnabled,
         messagesEnabled: d.messagesEnabled,
         dailyMessageLimit: d.dailyMessageLimit,
         deliveryTimes: normalizedTimes,
@@ -431,17 +478,20 @@ export class SettingsController {
     const parsed = callingSettingsSchema.safeParse(body);
     if (!parsed.success) throw new BadRequestException(parsed.error.issues[0]?.message || 'Invalid calling settings');
     const d = parsed.data;
+    if (parseHHMM(d.callingWindowStart) >= parseHHMM(d.callingWindowEnd)) {
+      throw new BadRequestException('Calling window start time must be earlier than end time');
+    }
     const tenantId = req.auth!.tenantId;
     const nowIso = new Date().toISOString();
 
     await this.db.execute(
       `UPDATE tenants
-       SET automation_enabled = ?, default_language = ?, default_call_time = ?,
+       SET automation_enabled = ?, calls_enabled = ?, default_language = ?, default_call_time = ?,
            calling_window_start = ?, calling_window_end = ?, calling_days_json = ?,
            max_attempts = ?, retry_interval_minutes = ?, max_calls_per_customer = ?, updated_at = ?
        WHERE id = ?`,
       [
-        d.automationEnabled, d.defaultLanguage, d.defaultCallTime,
+        d.automationEnabled, d.automationEnabled, d.defaultLanguage, d.defaultCallTime,
         d.callingWindowStart, d.callingWindowEnd, JSON.stringify(d.callingDays),
         d.maxAttempts, d.retryIntervalMinutes, d.maxCallsPerCustomer, nowIso, tenantId,
       ],
@@ -449,9 +499,16 @@ export class SettingsController {
 
     const existingTel = await this.db.queryOne<{
       id: string;
+      provider: string;
+      mode: string;
+      account_sid: string | null;
+      subdomain: string;
       api_key_encrypted: string | null;
       api_token_encrypted: string | null;
+      caller_id: string | null;
+      app_url: string | null;
       webhook_secret_encrypted: string | null;
+      trai_entity_id: string | null;
     }>(`SELECT * FROM telephony_configurations WHERE tenant_id = ?`, [tenantId]);
 
     const encKey = d.apiKey && d.apiKey.trim() ? encryptSecret(d.apiKey.trim()) : existingTel?.api_key_encrypted || null;
@@ -466,9 +523,39 @@ export class SettingsController {
              webhook_secret_encrypted = ?, trai_entity_id = ?, updated_at = ?
          WHERE tenant_id = ?`,
         [
-          d.provider || 'exotel', d.mode || 'mock', d.accountSid?.trim() || null, d.subdomain?.trim() || 'api.in.exotel.com',
-          encKey, encToken, d.callerId?.trim() || null, d.appUrl?.trim() || null, encWebhook, d.traiEntityId?.trim() || null,
-          nowIso, tenantId,
+          d.provider ?? existingTel.provider,
+          d.mode ?? existingTel.mode,
+          d.accountSid !== undefined ? d.accountSid?.trim() || null : existingTel.account_sid,
+          d.subdomain !== undefined ? d.subdomain?.trim() || 'api.in.exotel.com' : existingTel.subdomain,
+          encKey,
+          encToken,
+          d.callerId !== undefined ? d.callerId?.trim() || null : existingTel.caller_id,
+          d.appUrl !== undefined ? d.appUrl?.trim() || null : existingTel.app_url,
+          encWebhook,
+          d.traiEntityId !== undefined ? d.traiEntityId?.trim() || null : existingTel.trai_entity_id,
+          nowIso,
+          tenantId,
+        ],
+      );
+    } else {
+      await this.db.execute(
+        `INSERT INTO telephony_configurations (id, tenant_id, provider, mode, account_sid, subdomain, api_key_encrypted, api_token_encrypted, caller_id, app_url, webhook_secret_encrypted, trai_entity_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          crypto.randomUUID(),
+          tenantId,
+          d.provider || 'exotel',
+          d.mode || 'mock',
+          d.accountSid?.trim() || null,
+          d.subdomain?.trim() || 'api.in.exotel.com',
+          encKey,
+          encToken,
+          d.callerId?.trim() || null,
+          d.appUrl?.trim() || null,
+          encWebhook,
+          d.traiEntityId?.trim() || null,
+          nowIso,
+          nowIso,
         ],
       );
     }
@@ -527,23 +614,49 @@ export class SettingsController {
     const parsed = profileSchema.safeParse(body);
     if (!parsed.success) throw new BadRequestException(parsed.error.issues[0]?.message || 'Invalid profile details');
     const d = parsed.data;
-    const phone = d.mobileNumber && d.mobileNumber.trim().length >= 10 ? normalizeIndianPhone(d.mobileNumber) : (d.mobileNumber?.trim() || null);
-    const nowIso = new Date().toISOString();
 
+    let phone: string | null | undefined = undefined;
+    if (d.mobileNumber !== undefined) {
+      const trimmedPhone = d.mobileNumber?.trim() || '';
+      if (trimmedPhone.length > 0) {
+        const digits = trimmedPhone.replace(/\D/g, '');
+        if (digits.length < 10) {
+          throw new BadRequestException('Please enter a valid 10-digit mobile number');
+        }
+        phone = normalizeIndianPhone(trimmedPhone);
+      } else {
+        phone = null;
+      }
+    }
+
+    const nextEmail = d.email?.trim().toLowerCase();
+    if (nextEmail) {
+      const idError = validateStrongEmailId(nextEmail);
+      if (idError) throw new BadRequestException(idError);
+      const dupEmail = await this.db.queryOne<{ id: string }>(
+        `SELECT id FROM users WHERE LOWER(email) = ? AND id != ?`,
+        [nextEmail, req.auth!.userId],
+      );
+      if (dupEmail) {
+        throw new BadRequestException('This email address is already registered to another account');
+      }
+    }
+
+    const nowIso = new Date().toISOString();
     const fullName = d.fullName?.trim() || d.ownerName?.trim();
-    if (fullName || d.email || phone !== undefined) {
+    if (fullName || nextEmail || phone !== undefined) {
       await this.db.execute(
         `UPDATE users 
          SET full_name = COALESCE(?, full_name),
              email = COALESCE(?, email),
-             mobile_number = ?,
+             mobile_number = CASE WHEN ? THEN ? ELSE mobile_number END,
              updated_at = ?
          WHERE id = ? AND tenant_id = ?`,
-        [fullName || null, d.email?.trim().toLowerCase() || null, phone, nowIso, req.auth!.userId, req.auth!.tenantId],
+        [fullName || null, nextEmail || null, phone !== undefined, phone ?? null, nowIso, req.auth!.userId, req.auth!.tenantId],
       );
     }
 
-    if (d.businessName || d.ownerName || fullName || d.email || phone !== undefined || d.address !== undefined) {
+    if (d.businessName || d.ownerName || fullName || nextEmail || phone !== undefined || d.address !== undefined) {
       await this.db.execute(
         `UPDATE tenants
          SET business_name = COALESCE(?, business_name),
@@ -556,7 +669,7 @@ export class SettingsController {
         [
           d.businessName?.trim() || null,
           d.ownerName?.trim() || fullName || null,
-          d.email?.trim().toLowerCase() || null,
+          nextEmail || null,
           phone || null,
           d.address !== undefined,
           d.address?.trim() || null,

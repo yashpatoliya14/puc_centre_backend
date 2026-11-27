@@ -93,6 +93,7 @@ export class ScannerService implements OnModuleDestroy {
       extracted.rawText = rawText.slice(0, 500);
       return extracted;
     } catch (err: unknown) {
+      if (err instanceof BadRequestException) throw err;
       const msg = err instanceof Error ? err.message : String(err);
       this.logger.error(`Failed to parse PDF: ${msg}`);
       throw new BadRequestException(`Could not parse PDF document: ${msg}`);
@@ -267,7 +268,7 @@ export class ScannerService implements OnModuleDestroy {
     // 2. Certificate Number
     const certMatch =
       clean.match(
-        /(?:Certificate\s*(?:SL\.?|Serial)?\s*No\.?|PUC\s*Certificate\s*No\.?|PUCC\s*No\.?|Serial\s*No\.?)[\s:.\-]+([A-Z0-9\/\-]{6,26})/i,
+        /(?:Certificate[ \t]*(?:SL\.?|Serial)?[ \t]*No\.?|PUC[ \t]*Certificate[ \t]*No\.?|PUCC[ \t]*No\.?|Serial[ \t]*No\.?)(?:[ \t]*[:.\-]+[ \t]*|[ \t]+)([A-Z0-9\/\-]{6,26})/i,
       ) || clean.match(/\b([A-Z]{2}[0-9]{8,18})\b/i);
     const certificateNumber = certMatch ? certMatch[1].trim().toUpperCase() : '';
 
@@ -325,19 +326,19 @@ export class ScannerService implements OnModuleDestroy {
     }
 
     // 5. Fuel Type
-    const fuelMatch = clean.match(/(?:Fuel(?:\s*Type|\s*Used)?)[\s:.\-]+([^\n\r,]+)/i);
+    const fuelMatch = clean.match(/(?:Fuel(?:[ \t]*Type|[ \t]*Used)?)(?:[ \t]*[:.\-]+[ \t]*|[ \t]+)([^\n\r,]+)/i);
     const fuelRaw = fuelMatch ? fuelMatch[1] : clean;
     const fuelType = this.normalizeFuelType(fuelRaw);
 
     // 6. Vehicle Class / Type
     const classMatch = clean.match(
-      /(?:Vehicle\s*Category|Vehicle\s*Class|Class\s*of\s*Vehicle|Vehicle\s*Type)[\s:.\-]+([^\n\r,]+)/i,
+      /(?:Vehicle[ \t]*Category|Vehicle[ \t]*Class|Class[ \t]*of[ \t]*Vehicle|Vehicle[ \t]*Type)(?:[ \t]*[:.\-]+[ \t]*|[ \t]+)([^\n\r,]+)/i,
     );
     const vehicleType = this.normalizeVehicleType(classMatch ? classMatch[1] : clean);
 
     // 7. Make / Model
-    const makeMatch = clean.match(/(?:Make(?:\s*Name)?)[\s:.\-]+([^\n\r,]+)/i);
-    const modelMatch = clean.match(/(?:Model(?:\s*Name)?)[\s:.\-]+([^\n\r,]+)/i);
+    const makeMatch = clean.match(/(?:Make(?:[ \t]*Name)?)(?:[ \t]*[:.\-]+[ \t]*|[ \t]+)([^\n\r,]+)/i);
+    const modelMatch = clean.match(/(?:Model(?:[ \t]*Name)?)(?:[ \t]*[:.\-]+[ \t]*|[ \t]+)([^\n\r,]+)/i);
     let makeModel = '';
     if (makeMatch && modelMatch) {
       makeModel = `${makeMatch[1].trim()} ${modelMatch[1].trim()}`;
@@ -349,13 +350,13 @@ export class ScannerService implements OnModuleDestroy {
 
     // 8. Owner Name
     const nameMatch = clean.match(
-      /(?:Owner\s*Name|Registered\s*Owner|Customer\s*Name|Name\s*of\s*Owner)[\s:.\-]+([^\n\r,]+)/i,
+      /(?:Owner[ \t]*Name|Registered[ \t]*Owner|Customer[ \t]*Name|Name[ \t]*of[ \t]*Owner)(?:[ \t]*[:.\-]+[ \t]*|[ \t]+)([^\n\r,:]+)/i,
     );
     const fullName = nameMatch ? nameMatch[1].trim().replace(/\s+/g, ' ') : '';
 
     // 9. Mobile Number
     const mobileMatch = clean.match(
-      /(?:Mobile(?:\s*No\.?|\s*Number)?|Phone(?:\s*No\.?)?|Contact(?:\s*No\.?)?)[\s:.\-]+(?:\+?91[\s\-]?|0)?([6-9]\d{9})\b/i,
+      /(?:Mobile(?:[ \t]*No\.?|[ \t]*Number)?|Phone(?:[ \t]*No\.?)?|Contact(?:[ \t]*No\.?)?)(?:[ \t]*[:.\-]+[ \t]*|[ \t]+)(?:\+?91[\s\-]?|0)?([6-9]\d{9})\b/i,
     );
     const mobileNumber = mobileMatch ? mobileMatch[1].trim() : '';
 
@@ -404,13 +405,23 @@ export class ScannerService implements OnModuleDestroy {
     const trimmed = dStr.replace(/\s*([\/\-\.])\s*/g, '$1').trim();
 
     const formatValid = (y: string, m: string, d: string): string => {
+      const yearNum = Number(y);
       let monthNum = Number(m);
       let dayNum = Number(d);
+      if (!Number.isInteger(yearNum) || yearNum < 1990 || yearNum > 2100) return '';
       if (monthNum > 12 && dayNum <= 12) {
         [monthNum, dayNum] = [dayNum, monthNum];
       }
       if (monthNum < 1 || monthNum > 12 || dayNum < 1 || dayNum > 31) return '';
-      return `${y}-${String(monthNum).padStart(2, '0')}-${String(dayNum).padStart(2, '0')}`;
+      const dt = new Date(Date.UTC(yearNum, monthNum - 1, dayNum));
+      if (
+        dt.getUTCFullYear() !== yearNum ||
+        dt.getUTCMonth() !== monthNum - 1 ||
+        dt.getUTCDate() !== dayNum
+      ) {
+        return '';
+      }
+      return `${String(yearNum).padStart(4, '0')}-${String(monthNum).padStart(2, '0')}-${String(dayNum).padStart(2, '0')}`;
     };
 
     // YYYY-MM-DD or YYYY/MM/DD
@@ -454,6 +465,8 @@ export class ScannerService implements OnModuleDestroy {
     let year = m[3];
     if (year.length === 2) {
       year = '20' + year;
+    } else if (year.length !== 4) {
+      return '';
     }
     return formatValid(year, m[2], m[1]);
   }
@@ -486,20 +499,26 @@ export class ScannerService implements OnModuleDestroy {
     const today = getIstDateString();
 
     if (!issueDate && !expiryDate) {
-      const exp = new Date(today);
-      exp.setFullYear(exp.getFullYear() + 1);
+      const exp = new Date(`${today}T00:00:00Z`);
+      exp.setUTCFullYear(exp.getUTCFullYear() + 1);
       return { issueDate: today, expiryDate: exp.toISOString().slice(0, 10) };
     }
 
     if (issueDate && !expiryDate) {
-      const exp = new Date(issueDate);
-      exp.setFullYear(exp.getFullYear() + 1);
+      const exp = new Date(`${issueDate}T00:00:00Z`);
+      if (Number.isNaN(exp.getTime())) {
+        return { issueDate: today, expiryDate: today };
+      }
+      exp.setUTCFullYear(exp.getUTCFullYear() + 1);
       return { issueDate, expiryDate: exp.toISOString().slice(0, 10) };
     }
 
     if (!issueDate && expiryDate) {
-      const iss = new Date(expiryDate);
-      iss.setFullYear(iss.getFullYear() - 1);
+      const iss = new Date(`${expiryDate}T00:00:00Z`);
+      if (Number.isNaN(iss.getTime())) {
+        return { issueDate: today, expiryDate };
+      }
+      iss.setUTCFullYear(iss.getUTCFullYear() - 1);
       return { issueDate: iss.toISOString().slice(0, 10), expiryDate };
     }
 

@@ -4,6 +4,7 @@ import {
   BadGatewayException,
   ServiceUnavailableException,
 } from '@nestjs/common';
+import * as crypto from 'crypto';
 
 export interface SendTextMessageDto {
   to: string;
@@ -252,6 +253,7 @@ export class WhatsAppService {
         Authorization: `Bearer ${this.accessToken}`,
         'Content-Type': 'application/json',
       },
+      signal: AbortSignal.timeout(15000),
     });
 
     if (!res.ok) {
@@ -260,8 +262,13 @@ export class WhatsAppService {
       throw new BadGatewayException(`Meta API Error: ${errText}`);
     }
 
-    const json: any = await res.json();
-    return json.data || [];
+    const rawText = await res.text();
+    try {
+      const json = JSON.parse(rawText) as { data?: unknown[] };
+      return json.data || [];
+    } catch {
+      throw new BadGatewayException('Meta API returned invalid JSON while listing templates');
+    }
   }
 
   /**
@@ -269,11 +276,17 @@ export class WhatsAppService {
    */
   verifyWebhook(mode: string, token: string, challenge: string): string | null {
     const expectedToken = process.env.WHATSAPP_WEBHOOK_VERIFY_TOKEN?.trim();
-    if (mode === 'subscribe' && token === expectedToken) {
+    if (!expectedToken || !token || mode !== 'subscribe') {
+      this.logger.warn(`Meta Webhook verification failed or verify token unconfigured (mode "${mode}")`);
+      return null;
+    }
+    const a = Buffer.from(token, 'utf8');
+    const b = Buffer.from(expectedToken, 'utf8');
+    if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
       this.logger.log('Meta WhatsApp Webhook subscription verified successfully');
       return challenge;
     }
-    this.logger.warn(`Meta Webhook verification mismatch: got token "${token}", mode "${mode}"`);
+    this.logger.warn(`Meta Webhook verification mismatch (mode "${mode}")`);
     return null;
   }
 
@@ -320,9 +333,18 @@ export class WhatsAppService {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(15000),
       });
 
-      const json: any = await res.json();
+      const rawText = await res.text();
+      let json: any = {};
+      try {
+        json = rawText ? JSON.parse(rawText) : {};
+      } catch {
+        throw new BadGatewayException(
+          `WhatsApp API returned non-JSON response (HTTP ${res.status})`,
+        );
+      }
 
       if (!res.ok || json.error) {
         const metaError = json.error;
