@@ -395,6 +395,8 @@ export class SettingsController {
       },
     });
 
+    await this.reminderEngine.refreshScheduleForTenant(tenantId, d.messagesEnabled, normalizedTimes);
+
     if (d.messagesEnabled) {
       setImmediate(() => {
         this.reminderEngine.runWhatsAppSchedulerCycle(tenantId, { ignoreWindow: false }).catch((err) => {

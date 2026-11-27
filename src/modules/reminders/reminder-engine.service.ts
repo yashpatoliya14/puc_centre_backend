@@ -67,10 +67,14 @@ export function evaluateCallingEligibility(
 
 @Injectable()
 export class ReminderEngineService implements OnModuleDestroy {
+  private static readonly SYNC_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
+
   private bullQueue: Queue | null = null;
   private bullWorker: Worker | null = null;
   private schedulerInterval: NodeJS.Timeout | null = null;
   private startupWhatsAppTimer: NodeJS.Timeout | null = null;
+  private nextWhatsAppWakeupTimer: NodeJS.Timeout | null = null;
+  private cachedWhatsAppSlots = new Map<string, string[]>();
   private whatsappCycleRunning = false;
   private runningWhatsAppTenants = new Set<string>();
   private simulatedTimers = new Set<NodeJS.Timeout>();
@@ -109,15 +113,16 @@ export class ReminderEngineService implements OnModuleDestroy {
     }
 
     if (!this.schedulerInterval) {
-      // Run background call + WhatsApp scheduler every 60s
+      // Background DB sync runs once every 4 hours (instead of every 60s) to minimize API/DB calls;
+      // exact WhatsApp dispatch uses targeted single-shot timers to each configured IST slot.
       this.schedulerInterval = setInterval(() => {
         this.runSchedulerCycle(undefined, { ignoreWindow: false }).catch((err) => {
           console.error('[ReminderEngine] Background tick failed:', err);
         });
         this.runWhatsAppSchedulerCycle(undefined, { ignoreWindow: false }).catch((err) => {
-          console.error('[ReminderEngine] WhatsApp background tick failed:', err);
+          console.error('[ReminderEngine] WhatsApp 4-hour sync tick failed:', err);
         });
-      }, 60_000);
+      }, ReminderEngineService.SYNC_INTERVAL_MS);
     }
 
     if (!this.startupWhatsAppTimer) {
@@ -130,6 +135,48 @@ export class ReminderEngineService implements OnModuleDestroy {
     }
   }
 
+  private scheduleNextWhatsAppWakeup(now: Date = new Date()): void {
+    if (this.nextWhatsAppWakeupTimer) {
+      clearTimeout(this.nextWhatsAppWakeupTimer);
+      this.nextWhatsAppWakeupTimer = null;
+    }
+
+    const istMs = now.getTime() + 5.5 * 60 * 60 * 1000;
+    const istDate = new Date(istMs);
+    const nowSecs =
+      istDate.getUTCHours() * 3600 + istDate.getUTCMinutes() * 60 + istDate.getUTCSeconds();
+
+    let minDelaySecs = ReminderEngineService.SYNC_INTERVAL_MS / 1000;
+    for (const slots of this.cachedWhatsAppSlots.values()) {
+      for (const slot of slots) {
+        // Wake 5s after HH:mm:00 IST so we land cleanly inside [HH:mm, HH:mm + 5m)
+        const targetSecs = parseHHMM(slot) * 60 + 5;
+        const delta =
+          targetSecs > nowSecs ? targetSecs - nowSecs : 86400 - nowSecs + targetSecs;
+        if (delta < minDelaySecs) {
+          minDelaySecs = delta;
+        }
+      }
+    }
+
+    const delayMs = Math.max(5_000, Math.min(ReminderEngineService.SYNC_INTERVAL_MS, minDelaySecs * 1000));
+    this.nextWhatsAppWakeupTimer = setTimeout(() => {
+      this.nextWhatsAppWakeupTimer = null;
+      this.runWhatsAppSchedulerCycle(undefined, { ignoreWindow: false }).catch((err) => {
+        console.error('[ReminderEngine] Scheduled slot WhatsApp wakeup failed:', err);
+      });
+    }, delayMs);
+  }
+
+  async refreshScheduleForTenant(tenantId: string, messagesEnabled: boolean, deliveryTimes: string[]): Promise<void> {
+    if (messagesEnabled && deliveryTimes.length > 0) {
+      this.cachedWhatsAppSlots.set(tenantId, deliveryTimes);
+    } else {
+      this.cachedWhatsAppSlots.delete(tenantId);
+    }
+    this.scheduleNextWhatsAppWakeup(new Date());
+  }
+
   getQueueMode(): 'bullmq-redis' | 'in-process' {
     return this.bullQueue ? 'bullmq-redis' : 'in-process';
   }
@@ -137,6 +184,7 @@ export class ReminderEngineService implements OnModuleDestroy {
   async onModuleDestroy(): Promise<void> {
     if (this.schedulerInterval) clearInterval(this.schedulerInterval);
     if (this.startupWhatsAppTimer) clearTimeout(this.startupWhatsAppTimer);
+    if (this.nextWhatsAppWakeupTimer) clearTimeout(this.nextWhatsAppWakeupTimer);
     for (const timer of this.simulatedTimers) clearTimeout(timer);
     this.simulatedTimers.clear();
     if (this.bullWorker) await this.bullWorker.close().catch(() => {});
@@ -424,11 +472,13 @@ export class ReminderEngineService implements OnModuleDestroy {
         try {
           checkedTenants++;
           if (toBool(tenant.is_blocked) || !toBool(tenant.messages_enabled ?? true)) {
+            this.cachedWhatsAppSlots.delete(tenant.id);
             skipped++;
             continue;
           }
 
           const slots = this.parseDeliverySlots(tenant.delivery_times, tenant.delivery_frequency_count);
+          this.cachedWhatsAppSlots.set(tenant.id, slots);
           // Only dispatch during the configured slot window [HH:mm, HH:mm + 5m) IST so already-passed times never fire immediately on customer edits
           const dueSlots = slots.filter((s) => {
             const slotMin = parseHHMM(s);
@@ -687,6 +737,9 @@ export class ReminderEngineService implements OnModuleDestroy {
     } finally {
       if (!tenantIdFilter) {
         this.whatsappCycleRunning = false;
+        if (this.schedulerInterval) {
+          this.scheduleNextWhatsAppWakeup(new Date());
+        }
       }
     }
   }
