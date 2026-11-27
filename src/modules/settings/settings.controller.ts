@@ -102,6 +102,7 @@ const profileSchema = z.object({
   ownerName: z.string().min(2).max(100).optional(),
   email: z.string().email().optional(),
   mobileNumber: z.string().max(18).optional().nullable(),
+  address: z.string().max(300).optional().nullable(),
 });
 
 @Controller('api/settings')
@@ -540,13 +541,14 @@ export class SettingsController {
       );
     }
 
-    if (d.businessName || d.ownerName || fullName || d.email || phone !== undefined) {
+    if (d.businessName || d.ownerName || fullName || d.email || phone !== undefined || d.address !== undefined) {
       await this.db.execute(
         `UPDATE tenants
          SET business_name = COALESCE(?, business_name),
              owner_name = COALESCE(?, owner_name),
              email = COALESCE(?, email),
              mobile_number = COALESCE(?, mobile_number),
+             address = CASE WHEN ? THEN ? ELSE address END,
              updated_at = ?
          WHERE id = ?`,
         [
@@ -554,6 +556,8 @@ export class SettingsController {
           d.ownerName?.trim() || fullName || null,
           d.email?.trim().toLowerCase() || null,
           phone || null,
+          d.address !== undefined,
+          d.address?.trim() || null,
           nowIso,
           req.auth!.tenantId,
         ],
